@@ -2366,6 +2366,8 @@ class TECudaGraphHelper:
                         graphs_not_reset += 1
                 layer.cuda_graphs = []
                 layer.cuda_graph_manual_hooks = []
+                layer.cuda_graph_expected_hidden_state_shapes = []
+                layer.cuda_graph_replay_count = 0
 
         log_on_each_pipeline_stage(
             logger=logger,

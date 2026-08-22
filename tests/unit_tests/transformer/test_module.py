@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import cuda_graphs
 from megatron.core.transformer.module import (
     Float16Module,
     GraphableMegatronModule,
@@ -131,6 +132,27 @@ class TestGraphableMegatronModule:
 
         assert graph.calls == []
         assert module.cuda_graph_replay_count == 0
+
+    def test_te_cuda_graph_deletion_clears_replay_witnesses(self, monkeypatch):
+        module = self._make_module()
+        module.cuda_graphs = [StubCudaGraph()]
+        module.cuda_graph_manual_hooks = [(object(), ())]
+        module.cuda_graph_expected_hidden_state_shapes = [(4, 2, 12)]
+        module.cuda_graph_replay_count = 3
+        helper = cuda_graphs.TECudaGraphHelper.__new__(cuda_graphs.TECudaGraphHelper)
+        helper.callables_per_chunk = [[module]]
+        helper._graphs_created = True
+        monkeypatch.setattr(cuda_graphs, "is_te_min_version", lambda _: False)
+        monkeypatch.setattr(cuda_graphs, "log_on_each_pipeline_stage", lambda **_: None)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+        helper.delete_cuda_graphs()
+
+        assert module.cuda_graphs == []
+        assert module.cuda_graph_manual_hooks == []
+        assert module.cuda_graph_expected_hidden_state_shapes == []
+        assert module.cuda_graph_replay_count == 0
+        assert helper._graphs_created is False
 
 
 class TestFloat16Module:
