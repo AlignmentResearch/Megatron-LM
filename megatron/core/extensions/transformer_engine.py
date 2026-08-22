@@ -120,8 +120,16 @@ class _TorchGroupedFusedLoRA(torch.autograd.Function):
             x, augmented_weight.transpose(1, 2), offsets
         )
         base_output = augmented_output[:, :output_features]
-        low_rank = augmented_output[:, output_features:]
-        output = base_output + scale * low_rank.matmul(lora_b.transpose(0, 1))
+        low_rank = augmented_output[:, output_features:].clone(
+            memory_format=torch.contiguous_format
+        )
+        output = torch.addmm(
+            base_output,
+            low_rank,
+            lora_b.transpose(0, 1),
+            beta=1,
+            alpha=scale,
+        )
 
         ctx.save_for_backward(x, lora_b, low_rank, offsets)
         ctx.augmented_weight = augmented_weight

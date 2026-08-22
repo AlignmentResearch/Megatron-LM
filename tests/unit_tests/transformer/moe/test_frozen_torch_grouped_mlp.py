@@ -273,14 +273,20 @@ class TestFrozenTorchGroupedMLP:
         )
 
 
-def test_fused_expert_lora_matches_shared_adapter_and_gradients_on_cpu():
+@pytest.mark.parametrize(
+    "group_sizes",
+    ([2, 0, 3], [1, 0, 0]),
+    ids=["multiple-tokens", "single-token"],
+)
+def test_fused_expert_lora_matches_shared_adapter_and_gradients_on_cpu(group_sizes):
     torch.manual_seed(7)
-    group_sizes = [2, 0, 3]
     offsets = torch.tensor(group_sizes, dtype=torch.int32).cumsum(0)
     base_weight = torch.randn(3, 7, 5, dtype=torch.double)
     reference_a = torch.randn(3, 5, dtype=torch.double, requires_grad=True)
     reference_b = torch.randn(7, 3, dtype=torch.double, requires_grad=True)
-    reference_input = torch.randn(5, 5, dtype=torch.double, requires_grad=True)
+    reference_input = torch.randn(
+        sum(group_sizes), 5, dtype=torch.double, requires_grad=True
+    )
     fused_input = reference_input.detach().clone().requires_grad_(True)
     fused_a = reference_a.detach().clone().requires_grad_(True)
     fused_b = reference_b.detach().clone().requires_grad_(True)
@@ -308,6 +314,11 @@ def test_fused_expert_lora_matches_shared_adapter_and_gradients_on_cpu():
         7,
         scale,
         counters,
+    )
+    saved_low_rank = fused.grad_fn.saved_tensors[2]
+    assert saved_low_rank.is_contiguous()
+    assert saved_low_rank.untyped_storage().nbytes() == (
+        saved_low_rank.numel() * saved_low_rank.element_size()
     )
     grad_output = torch.randn_like(reference)
     reference_grads = torch.autograd.grad(
