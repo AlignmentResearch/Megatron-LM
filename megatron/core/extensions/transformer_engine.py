@@ -124,6 +124,63 @@ def _set_expert_parameter_attributes(
             param.partition_stride = 1
 
 
+def _run_torch_grouped_mm(x: Tensor, weight: Tensor, offsets: Tensor) -> Tensor:
+    """Run grouped matrix multiplication with a CPU reference for unit tests."""
+    if x.device.type == 'cuda':
+        return torch._grouped_mm(x, weight, offs=offsets)
+
+    outputs = []
+    start = 0
+    for group, end_tensor in enumerate(offsets):
+        end = int(end_tensor)
+        outputs.append(x[start:end].matmul(weight[group]))
+        start = end
+    if not outputs:
+        return x.new_empty((0, weight.shape[-1]))
+    return torch.cat(outputs, dim=0)
+
+
+class _TorchGroupedFusedLoRA(torch.autograd.Function):
+    """Differentiate a frozen grouped GEMM with a shared low-rank branch."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: Tensor,
+        augmented_weight: Tensor,
+        lora_a: Tensor,
+        lora_b: Tensor,
+        offsets: Tensor,
+        output_features: int,
+        scale: float,
+        counters: Dict[str, int],
+    ) -> Tensor:
+        with torch.no_grad():
+            augmented_weight[:, output_features:, :].copy_(lora_a)
+        augmented_output = _run_torch_grouped_mm(x, augmented_weight.transpose(1, 2), offsets)
+        base_output = augmented_output[:, :output_features]
+        low_rank = augmented_output[:, output_features:]
+        output = base_output + scale * low_rank.matmul(lora_b.transpose(0, 1))
+
+        ctx.save_for_backward(x, lora_b, low_rank, offsets)
+        ctx.augmented_weight = augmented_weight
+        ctx.scale = scale
+        ctx.counters = counters
+        counters["forward_calls"] += 1
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        x, lora_b, low_rank, offsets = ctx.saved_tensors
+        grad_low_rank = ctx.scale * grad_output.matmul(lora_b)
+        grad_augmented_output = torch.cat((grad_output, grad_low_rank), dim=-1)
+        grad_x = _run_torch_grouped_mm(grad_augmented_output, ctx.augmented_weight, offsets)
+        grad_lora_a = grad_low_rank.transpose(0, 1).matmul(x)
+        grad_lora_b = ctx.scale * grad_output.transpose(0, 1).matmul(low_rank)
+        ctx.counters["backward_calls"] += 1
+        return grad_x, None, grad_lora_a, grad_lora_b, None, None, None, None
+
+
 class TransformerEngineConfigType(enum.Enum):
     """Configuration object types in config dictionary"""
 
@@ -2664,6 +2721,37 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     return False
             return True
 
+        def _torch_grouped_fused_lora_layout_is_current(self, rank: int) -> bool:
+            """Return whether expert parameters view the augmented grouped buffer."""
+            augmented_weight = self._buffers.get("_torch_grouped_fused_lora_weight")
+            if augmented_weight is None or augmented_weight.shape[0] != self.num_gemms:
+                return False
+
+            first_weight = self.weight0
+            expected_shape = (self.num_gemms, first_weight.shape[0] + rank, first_weight.shape[1])
+            if (
+                augmented_weight.device != first_weight.device
+                or augmented_weight.dtype != first_weight.dtype
+                or augmented_weight.shape != expected_shape
+            ):
+                return False
+
+            storage_pointer = augmented_weight.untyped_storage().data_ptr()
+            group_elements = augmented_weight.shape[1] * augmented_weight.shape[2]
+            for index in range(self.num_gemms):
+                weight = getattr(self, f"weight{index}")
+                weight_view = augmented_weight[index, : first_weight.shape[0], :]
+                if (
+                    weight.device != augmented_weight.device
+                    or weight.dtype != augmented_weight.dtype
+                    or weight.shape != weight_view.shape
+                    or weight.untyped_storage().data_ptr() != storage_pointer
+                    or weight.storage_offset() != index * group_elements
+                    or weight.stride() != weight_view.stride()
+                ):
+                    return False
+            return True
+
         @torch.no_grad()
         def prepare_torch_grouped_mm(self) -> int:
             """Relocate frozen BF16 expert weights into one contiguous allocation.
@@ -2703,6 +2791,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 grouped_weight = torch.stack([weight.detach() for weight in weights]).contiguous()
                 for index, weight in enumerate(weights):
                     weight.data = grouped_weight[index]
+                self._buffers.pop("_torch_grouped_fused_lora_weight", None)
                 if '_torch_grouped_weight' in self._buffers:
                     self._buffers['_torch_grouped_weight'] = grouped_weight
                 else:
@@ -2710,6 +2799,146 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             grouped_weight = self._buffers['_torch_grouped_weight']
             return grouped_weight.numel() * grouped_weight.element_size()
+
+        @torch.no_grad()
+        def prepare_torch_grouped_mm_fused_lora(self, lora_a: Tensor) -> Dict[str, Any]:
+            """Prepare augmented frozen expert weights for shared LoRA-A fusion."""
+            if self.expert_gemm_backend != "torch":
+                raise RuntimeError("fused expert LoRA requires moe_expert_gemm_backend='torch'")
+            if not hasattr(torch, "_grouped_mm"):
+                raise RuntimeError("this PyTorch build does not provide torch._grouped_mm")
+            if self.use_bias:
+                raise RuntimeError("fused expert LoRA does not support expert bias")
+
+            weights = [getattr(self, f"weight{index}") for index in range(self.num_gemms)]
+            if any(weight.requires_grad for weight in weights):
+                raise RuntimeError("fused expert LoRA requires frozen base weights")
+            if any(weight.device.type != "cuda" for weight in weights):
+                raise RuntimeError("fused expert LoRA requires CUDA weights")
+            if any(weight.dtype != torch.bfloat16 for weight in weights):
+                raise RuntimeError("fused expert LoRA requires BF16 base weights")
+            if any(weight.shape != weights[0].shape for weight in weights[1:]):
+                raise RuntimeError("fused expert LoRA requires uniform expert shapes")
+            if lora_a.device != weights[0].device or lora_a.dtype != torch.bfloat16:
+                raise RuntimeError("fused expert LoRA requires a BF16 LoRA-A on the base device")
+            if lora_a.ndim != 2 or lora_a.shape[1] != weights[0].shape[1]:
+                raise RuntimeError(
+                    f"LoRA-A shape {tuple(lora_a.shape)} does not match base input "
+                    f"features {weights[0].shape[1]}"
+                )
+
+            memory_allocated_before = torch.cuda.memory_allocated(lora_a.device)
+            memory_allocated_at_coexistence = memory_allocated_before
+            peak_allocated_before = torch.cuda.max_memory_allocated(lora_a.device)
+            rank = lora_a.shape[0]
+            if not self._torch_grouped_fused_lora_layout_is_current(rank):
+                output_features, input_features = weights[0].shape
+                augmented_weight = weights[0].new_empty(
+                    (self.num_gemms, output_features + rank, input_features)
+                )
+                memory_allocated_at_coexistence = torch.cuda.memory_allocated(lora_a.device)
+                for index, weight in enumerate(weights):
+                    augmented_weight[index, :output_features, :].copy_(weight)
+                    weight.data = augmented_weight[index, :output_features, :]
+                augmented_weight[:, output_features:, :].copy_(lora_a)
+                self._buffers.pop("_torch_grouped_weight", None)
+                if "_torch_grouped_fused_lora_weight" in self._buffers:
+                    self._buffers["_torch_grouped_fused_lora_weight"] = augmented_weight
+                else:
+                    self.register_buffer(
+                        "_torch_grouped_fused_lora_weight", augmented_weight, persistent=False
+                    )
+
+            augmented_weight = self._buffers["_torch_grouped_fused_lora_weight"]
+            if "_torch_grouped_weight" in self._buffers:
+                raise RuntimeError("fused expert LoRA retained the separate grouped base buffer")
+            if not self._torch_grouped_fused_lora_layout_is_current(rank):
+                raise RuntimeError(
+                    "fused expert LoRA parameters do not share the augmented backing storage"
+                )
+            base_storage_bytes = sum(weight.numel() * weight.element_size() for weight in weights)
+            resident_storage_bytes = augmented_weight.numel() * augmented_weight.element_size()
+            memory_allocated_after = torch.cuda.memory_allocated(lora_a.device)
+            return {
+                "base_storage_bytes": base_storage_bytes,
+                "augmentation_storage_bytes": resident_storage_bytes - base_storage_bytes,
+                "resident_storage_bytes": resident_storage_bytes,
+                "duplicate_base_buffer_present": False,
+                "base_parameters_share_augmented_storage": True,
+                "cuda_memory_allocated_before": memory_allocated_before,
+                "cuda_memory_allocated_at_coexistence": memory_allocated_at_coexistence,
+                "cuda_relocation_peak_delta": (
+                    memory_allocated_at_coexistence - memory_allocated_before
+                ),
+                "cuda_memory_allocated_after": memory_allocated_after,
+                "cuda_memory_allocated_delta": memory_allocated_after - memory_allocated_before,
+                "cuda_peak_allocated_before": peak_allocated_before,
+                "cuda_peak_allocated_after": torch.cuda.max_memory_allocated(lora_a.device),
+            }
+
+        def torch_grouped_mm_fused_lora_forward(
+            self,
+            x: Tensor,
+            m_splits: List[int],
+            *,
+            lora_a: Tensor,
+            lora_b: Tensor,
+            scale: float,
+            adapter_enabled: bool,
+            counters: Dict[str, int],
+        ) -> Tuple[Tensor, None]:
+            """Run the frozen grouped base and shared LoRA branch in one grouped GEMM."""
+            if not self._torch_grouped_fused_lora_layout_is_current(lora_a.shape[0]):
+                self.prepare_torch_grouped_mm_fused_lora(lora_a)
+            x_2d = x.reshape(-1, x.shape[-1])
+            input_rows = sum(m_splits)
+            if input_rows != x_2d.shape[0]:
+                raise RuntimeError(
+                    f"expert splits sum to {input_rows}, but input has {x_2d.shape[0]} rows"
+                )
+
+            augmented_weight = self._buffers["_torch_grouped_fused_lora_weight"]
+            output_features = self.weight0.shape[0]
+            if lora_b.device != x.device or lora_b.dtype != torch.bfloat16:
+                raise RuntimeError("fused expert LoRA requires a BF16 LoRA-B on the input device")
+            if lora_b.shape != (output_features, lora_a.shape[0]):
+                raise RuntimeError(
+                    f"LoRA-B shape {tuple(lora_b.shape)} does not match "
+                    f"({output_features}, {lora_a.shape[0]})"
+                )
+
+            if input_rows == 0:
+                base_output = x_2d.matmul(self.weight0.transpose(0, 1))
+                if adapter_enabled:
+                    output = base_output + scale * x_2d.matmul(lora_a.transpose(0, 1)).matmul(
+                        lora_b.transpose(0, 1)
+                    )
+                    counters["forward_calls"] += 1
+                else:
+                    output = base_output
+                    counters["base_only_forward_calls"] += 1
+            else:
+                offsets = torch.tensor(
+                    list(accumulate(m_splits)), device=x.device, dtype=torch.int32
+                )
+                if adapter_enabled:
+                    output = _TorchGroupedFusedLoRA.apply(
+                        x_2d,
+                        augmented_weight,
+                        lora_a,
+                        lora_b,
+                        offsets,
+                        output_features,
+                        scale,
+                        counters,
+                    )
+                else:
+                    augmented_output = torch._grouped_mm(
+                        x_2d, augmented_weight.transpose(1, 2), offs=offsets
+                    )
+                    output = augmented_output[:, :output_features]
+                    counters["base_only_forward_calls"] += 1
+            return output.reshape(*x.shape[:-1], output.shape[-1]), None
 
         @property
         def torch_grouped_mm_prepared(self) -> bool:

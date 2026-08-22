@@ -6,6 +6,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.extensions.transformer_engine import (
+    _TorchGroupedFusedLoRA,
+    _run_torch_grouped_mm,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -259,3 +263,162 @@ class TestFrozenTorchGroupedMLP:
         torch.testing.assert_close(
             torch_input.grad, baseline_input.grad, rtol=0.02, atol=0.02
         )
+
+
+def test_fused_expert_lora_matches_shared_adapter_and_gradients_on_cpu():
+    torch.manual_seed(7)
+    group_sizes = [2, 0, 3]
+    offsets = torch.tensor(group_sizes, dtype=torch.int32).cumsum(0)
+    base_weight = torch.randn(3, 7, 5, dtype=torch.double)
+    reference_a = torch.randn(3, 5, dtype=torch.double, requires_grad=True)
+    reference_b = torch.randn(7, 3, dtype=torch.double, requires_grad=True)
+    reference_input = torch.randn(5, 5, dtype=torch.double, requires_grad=True)
+    fused_input = reference_input.detach().clone().requires_grad_(True)
+    fused_a = reference_a.detach().clone().requires_grad_(True)
+    fused_b = reference_b.detach().clone().requires_grad_(True)
+    scale = 2.5
+    base_output = _run_torch_grouped_mm(
+        reference_input, base_weight.transpose(1, 2), offsets
+    )
+    reference = base_output + scale * reference_input.matmul(
+        reference_a.transpose(0, 1)
+    ).matmul(reference_b.transpose(0, 1))
+    augmented_weight = base_weight.new_empty((3, 10, 5))
+    augmented_weight[:, :7, :].copy_(base_weight)
+    augmented_weight[:, 7:, :].copy_(fused_a)
+    counters = {
+        "forward_calls": 0,
+        "backward_calls": 0,
+        "base_only_forward_calls": 0,
+    }
+    fused = _TorchGroupedFusedLoRA.apply(
+        fused_input,
+        augmented_weight,
+        fused_a,
+        fused_b,
+        offsets,
+        7,
+        scale,
+        counters,
+    )
+    grad_output = torch.randn_like(reference)
+    reference_grads = torch.autograd.grad(
+        reference, (reference_input, reference_a, reference_b), grad_output
+    )
+    fused_grads = torch.autograd.grad(
+        fused, (fused_input, fused_a, fused_b), grad_output
+    )
+
+    torch.testing.assert_close(fused, reference)
+    for actual, expected in zip(fused_grads, reference_grads):
+        torch.testing.assert_close(actual, expected)
+    assert counters == {
+        "forward_calls": 1,
+        "backward_calls": 1,
+        "base_only_forward_calls": 0,
+    }
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not hasattr(torch, "_grouped_mm")
+    or torch.cuda.get_device_capability()[0] < 10,
+    reason="production fused expert LoRA parity requires a Blackwell CUDA device",
+)
+@pytest.mark.parametrize(
+    ("input_features", "output_features"),
+    [(1024, 2688), (2688, 1024)],
+    ids=["super-fc1", "super-fc2"],
+)
+def test_fused_expert_lora_super_shapes_over_repeated_updates(input_features, output_features):
+    generator = torch.Generator(device="cuda").manual_seed(20260822)
+    group_sizes = [0 if index % 17 == 0 else 1 + (index * 13) % 4 for index in range(128)]
+    offsets = torch.tensor(group_sizes, device="cuda", dtype=torch.int32).cumsum(0)
+    rows = sum(group_sizes)
+    rank = 32
+    scale = 64.0 / rank
+    base_weight = torch.randn(
+        (len(group_sizes), output_features, input_features),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    reference_a = torch.randn(
+        (rank, input_features),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+        requires_grad=True,
+    )
+    reference_b = torch.randn(
+        (output_features, rank),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+        requires_grad=True,
+    )
+    fused_a = reference_a.detach().clone().requires_grad_(True)
+    fused_b = reference_b.detach().clone().requires_grad_(True)
+    augmented_weight = base_weight.new_empty(
+        (len(group_sizes), output_features + rank, input_features)
+    )
+    augmented_weight[:, :output_features, :].copy_(base_weight)
+    augmented_weight[:, output_features:, :].copy_(fused_a)
+    reference_optimizer = torch.optim.SGD([reference_a, reference_b], lr=0.01)
+    fused_optimizer = torch.optim.SGD([fused_a, fused_b], lr=0.01)
+    counters = {"forward_calls": 0, "backward_calls": 0, "base_only_forward_calls": 0}
+
+    for _ in range(3):
+        reference_optimizer.zero_grad()
+        fused_optimizer.zero_grad()
+        reference_inputs = []
+        fused_inputs = []
+        reference_outputs = []
+        fused_outputs = []
+        for _ in range(2):
+            reference_input = torch.randn(
+                (rows, input_features),
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=generator,
+                requires_grad=True,
+            )
+            fused_input = reference_input.detach().clone().requires_grad_(True)
+            base_output = torch._grouped_mm(
+                reference_input, base_weight.transpose(1, 2), offs=offsets
+            )
+            reference_output = base_output + scale * reference_input.matmul(
+                reference_a.transpose(0, 1)
+            ).matmul(reference_b.transpose(0, 1))
+            fused_output = _TorchGroupedFusedLoRA.apply(
+                fused_input,
+                augmented_weight,
+                fused_a,
+                fused_b,
+                offsets,
+                output_features,
+                scale,
+                counters,
+            )
+            torch.testing.assert_close(fused_output, reference_output, rtol=0.02, atol=0.02)
+            reference_inputs.append(reference_input)
+            fused_inputs.append(fused_input)
+            reference_outputs.append(reference_output)
+            fused_outputs.append(fused_output)
+
+        grad_output = torch.randn(
+            reference_outputs[0].shape, device="cuda", dtype=torch.bfloat16, generator=generator
+        )
+        torch.autograd.backward(reference_outputs, [grad_output, grad_output])
+        torch.autograd.backward(fused_outputs, [grad_output, grad_output])
+        for fused_input, reference_input in zip(fused_inputs, reference_inputs):
+            torch.testing.assert_close(fused_input.grad, reference_input.grad, rtol=0.02, atol=0.02)
+        torch.testing.assert_close(fused_a.grad, reference_a.grad, rtol=0.02, atol=0.02)
+        torch.testing.assert_close(fused_b.grad, reference_b.grad, rtol=0.02, atol=0.02)
+        reference_optimizer.step()
+        fused_optimizer.step()
+        torch.testing.assert_close(fused_a, reference_a, rtol=0.02, atol=0.02)
+        torch.testing.assert_close(fused_b, reference_b, rtol=0.02, atol=0.02)
+
+    assert any(size == 0 for size in group_sizes)
+    assert counters == {"forward_calls": 6, "backward_calls": 6, "base_only_forward_calls": 0}
