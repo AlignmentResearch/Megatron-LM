@@ -168,6 +168,9 @@ class GraphableMegatronModule(MegatronModule):
 
         assert isinstance(config, TransformerConfig), "config must be a TransformerConfig"
 
+        self.cuda_graph_expected_hidden_state_shapes = []
+        self.cuda_graph_replay_count = 0
+
         # Enable cuda graphs.
         if (
             config.cuda_graph_impl == "local"
@@ -304,9 +307,27 @@ class GraphableMegatronModule(MegatronModule):
         cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
 
+        if cg_index >= len(self.cuda_graph_expected_hidden_state_shapes):
+            raise RuntimeError(
+                f"Missing expected hidden-state shape for CUDA graph {cg_index} in "
+                f"{type(self).__name__}; found "
+                f"{len(self.cuda_graph_expected_hidden_state_shapes)} shape records for "
+                f"{len(self.cuda_graphs)} graphs."
+            )
+        expected_shape = self.cuda_graph_expected_hidden_state_shapes[cg_index]
+        actual_shape = tuple(cudagraph_args[0].shape)
+        if actual_shape != expected_shape:
+            current_microbatch = getattr(self, 'current_microbatch', 0)
+            raise RuntimeError(
+                f"CUDA graph {cg_index} in {type(self).__name__} expected hidden-state shape "
+                f"{expected_shape}, but microbatch {current_microbatch} provided {actual_shape}."
+            )
+
         for hook, hook_args in self.cuda_graph_manual_hooks:
             hook(*hook_args)
-        return self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+        output = self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+        self.cuda_graph_replay_count += 1
+        return output
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
         """Helper function to get tensor arguments for TE CUDA graph."""

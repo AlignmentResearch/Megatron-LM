@@ -4,7 +4,11 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.module import Float16Module, MegatronModule
+from megatron.core.transformer.module import (
+    Float16Module,
+    GraphableMegatronModule,
+    MegatronModule,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -22,6 +26,22 @@ class DummyModule(MegatronModule):
 
     def forward(self, x):
         return self.linear(x)
+
+
+class DummyGraphableModule(GraphableMegatronModule):
+
+    def forward(self, hidden_states):
+        return hidden_states
+
+
+class StubCudaGraph:
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return args
 
 
 class TestMegatronModule:
@@ -51,6 +71,66 @@ class TestMegatronModule:
         # failed_module = megatron_module
         # failed_module.fp16 = True
         # failed_module.bf16 = True
+
+
+class TestGraphableMegatronModule:
+
+    @staticmethod
+    def _make_module():
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+        )
+        return DummyGraphableModule(config=transformer_config)
+
+    def test_te_cuda_graph_replay_records_successful_replay(self):
+        module = self._make_module()
+        graph_0 = StubCudaGraph()
+        graph_1 = StubCudaGraph()
+        module.cuda_graphs = [graph_0, graph_1]
+        module.cuda_graph_expected_hidden_state_shapes = [(4, 2, 12), (6, 2, 12)]
+        module.current_microbatch = 3
+
+        hidden_states = torch.ones((6, 2, 12))
+        output = module._te_cuda_graph_replay(hidden_states)
+
+        assert output[0] is hidden_states
+        assert graph_0.calls == []
+        assert len(graph_1.calls) == 1
+        assert graph_1.calls[0][1]["is_first_microbatch"] is False
+        assert module.cuda_graph_replay_count == 1
+
+    def test_te_cuda_graph_replay_rejects_hidden_state_shape_mismatch(self):
+        module = self._make_module()
+        graph = StubCudaGraph()
+        module.cuda_graphs = [graph]
+        module.cuda_graph_expected_hidden_state_shapes = [(4, 2, 12)]
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r"CUDA graph 0 in DummyGraphableModule expected hidden-state shape "
+                r"\(4, 2, 12\), but microbatch 0 provided \(6, 2, 12\)"
+            ),
+        ):
+            module._te_cuda_graph_replay(torch.ones((6, 2, 12)))
+
+        assert graph.calls == []
+        assert module.cuda_graph_replay_count == 0
+
+    def test_te_cuda_graph_replay_requires_shape_record(self):
+        module = self._make_module()
+        graph = StubCudaGraph()
+        module.cuda_graphs = [graph]
+
+        with pytest.raises(RuntimeError, match="Missing expected hidden-state shape"):
+            module._te_cuda_graph_replay(torch.ones((4, 2, 12)))
+
+        assert graph.calls == []
+        assert module.cuda_graph_replay_count == 0
 
 
 class TestFloat16Module:

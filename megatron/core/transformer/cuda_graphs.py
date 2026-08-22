@@ -2315,6 +2315,8 @@ class TECudaGraphHelper:
             for layers in self.callables_per_chunk:
                 for layer_number, layer in enumerate(layers):
                     layer.cuda_graphs = []
+                    layer.cuda_graph_expected_hidden_state_shapes = []
+                    layer.cuda_graph_replay_count = 0
                     for batch_number in range(self.num_microbatches):
                         if self.config.overlap_moe_expert_parallel_comm:
                             graph_idx = (
@@ -2327,6 +2329,9 @@ class TECudaGraphHelper:
                                 + layer_number
                             )
                         layer.cuda_graphs.append(graphs[graph_idx])
+                        layer.cuda_graph_expected_hidden_state_shapes.append(
+                            tuple(sample_args[graph_idx][0].shape)
+                        )
                 num_layers_accumulated += len(layers)
 
             self._graphs_created = True
