@@ -333,7 +333,9 @@ def test_fused_expert_lora_matches_shared_adapter_and_gradients_on_cpu():
 def test_fused_expert_lora_super_shapes_over_repeated_updates(input_features, output_features):
     generator = torch.Generator(device="cuda").manual_seed(20260822)
     group_sizes = [0 if index % 17 == 0 else 1 + (index * 13) % 4 for index in range(128)]
-    offsets = torch.tensor(group_sizes, device="cuda", dtype=torch.int32).cumsum(0)
+    offsets = torch.tensor(group_sizes, device="cuda").cumsum(
+        0, dtype=torch.int32
+    )
     rows = sum(group_sizes)
     rank = 32
     scale = 64.0 / rank
