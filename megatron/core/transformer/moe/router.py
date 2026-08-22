@@ -103,7 +103,13 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
+        logits = router_gating_linear(
+            input,
+            self.weight,
+            self.bias,
+            router_dtype,
+            skip_frozen_weight_gradient=self.config.moe_router_skip_frozen_weight_gradient,
+        )
         return logits
 
     @abstractmethod
@@ -669,6 +675,9 @@ class TopKRouter(Router):
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+
+        if self.config.moe_router_prob_dtype == 'fp32':
+            probs = probs.float()
 
         return probs, routing_map
 

@@ -10,11 +10,30 @@ from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
+from megatron.core.transformer.moe.token_dispatcher import _DeepepManager
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_deepep_metadata_preserves_routes_when_probabilities_underflow():
+    manager = object.__new__(_DeepepManager)
+    manager.num_experts = 8
+    manager.router_topk = 2
+    manager.capacity_factor = 1.0
+    routing_map = torch.tensor(
+        [[True, True, False, False, False, False, False, False]], dtype=torch.bool
+    )
+    fp64_probs = torch.tensor(
+        [[1e-50, 2e-50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float64
+    )
+
+    manager.setup_metadata(routing_map, fp64_probs.float())
+
+    assert set(manager.token_indices[0].tolist()) == {0, 1}
+    assert torch.equal(manager.token_probs, torch.zeros_like(manager.token_probs))
 
 
 def token_permutation(token_dispatcher, hidden_states, probs, indices):

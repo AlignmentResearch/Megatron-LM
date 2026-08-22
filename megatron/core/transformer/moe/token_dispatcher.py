@@ -1141,6 +1141,7 @@ class _DeepepManager(_DispatchManager):
         self.router_topk = router_topk
         self.num_experts = num_experts
         self.router_dtype = config.moe_router_dtype
+        self.router_prob_dtype = config.moe_router_prob_dtype
         self.capacity_factor = config.moe_expert_capacity_factor
         self.permute_fusion = config.moe_permute_fusion
 
@@ -1162,12 +1163,15 @@ class _DeepepManager(_DispatchManager):
 
         routing_map = routing_map.reshape(num_tokens, self.num_experts)
         probs = probs.reshape(num_tokens, self.num_experts)
-        # Convert the format of routing map from multihot to indices.
-        self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
-        # Mask the indices of dropped tokens with -1
-        if self.capacity_factor is not None:
-            mask = self.token_probs == 0
-            self.token_indices = self.token_indices.masked_fill(mask, -1)
+        # Restrict top-k to the experts already selected by the router. This preserves routing
+        # when routing probabilities are cast to a lower precision before dispatch.
+        selected_probs = probs.masked_fill(~routing_map, float('-inf'))
+        self.token_probs, self.token_indices = torch.topk(
+            selected_probs, self.router_topk, dim=-1
+        )
+        valid = routing_map.gather(dim=-1, index=self.token_indices)
+        self.token_probs = self.token_probs.masked_fill(~valid, 0)
+        self.token_indices = self.token_indices.masked_fill(~valid, -1)
 
     def dispatch(
         self,
@@ -1315,7 +1319,7 @@ class _DeepepManager(_DispatchManager):
             tokens_per_expert=self.tokens_per_expert,
             align_size=get_align_size_for_quantization(self.config),
         )
-        if self.router_dtype == "fp64":
+        if self.router_dtype == "fp64" and self.router_prob_dtype is None:
             permuted_probs = permuted_probs.to(torch.float64)
         return hidden_states, permuted_probs
 

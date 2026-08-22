@@ -703,6 +703,21 @@ class TransformerConfig(ModelParallelConfig):
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
     None means no changes for dtype."""
 
+    moe_router_prob_dtype: Optional[Literal['fp32']] = None
+    """Optional dtype for routing probabilities after expert selection.
+
+    ``fp32`` preserves routing decisions made in ``moe_router_dtype`` while using float32
+    probabilities for token dispatch and expert output weighting. None keeps routing
+    probabilities in ``moe_router_dtype``.
+    """
+
+    moe_router_skip_frozen_weight_gradient: bool = False
+    """Skip router weight-gradient work when the router parameters are frozen.
+
+    This also avoids retaining router inputs solely for an unused weight gradient. The default
+    preserves the existing custom-autograd behavior.
+    """
+
     moe_router_enable_expert_bias: bool = False
     """TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy.
     The routing decision is based on the sum of the routing scores and the expert bias.

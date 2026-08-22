@@ -25,6 +25,49 @@ except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
 
 
+def test_router_gating_skips_frozen_weight_gradient_and_input_save(monkeypatch):
+    real_mm = torch.mm
+    mm_calls = []
+
+    def record_mm(left, right):
+        mm_calls.append((left.shape, right.shape))
+        return real_mm(left, right)
+
+    monkeypatch.setattr(torch, "mm", record_mm)
+    input_data = torch.randn(7, 4, dtype=torch.float64)
+    weight = torch.randn(3, 4, dtype=torch.float64)
+
+    def run(*, skip_frozen_weight_gradient):
+        inp = input_data.clone().requires_grad_()
+        saved_shapes = []
+
+        def record_saved_tensor(tensor):
+            saved_shapes.append(tensor.shape)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(record_saved_tensor, lambda tensor: tensor):
+            output = router_gating_linear(
+                inp,
+                weight,
+                None,
+                torch.float64,
+                skip_frozen_weight_gradient=skip_frozen_weight_gradient,
+            )
+            output.square().sum().backward()
+        return inp.grad, saved_shapes
+
+    baseline_gradient, baseline_saved_shapes = run(skip_frozen_weight_gradient=False)
+    baseline_mm_calls = len(mm_calls)
+    mm_calls.clear()
+    optimized_gradient, optimized_saved_shapes = run(skip_frozen_weight_gradient=True)
+
+    torch.testing.assert_close(optimized_gradient, baseline_gradient)
+    assert baseline_mm_calls == 3
+    assert len(mm_calls) == 2
+    assert torch.Size([7, 4]) in baseline_saved_shapes
+    assert torch.Size([7, 4]) not in optimized_saved_shapes
+
+
 class TestTop2Router:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -204,10 +247,18 @@ class TestTop2Router:
         # Test with fp64 enabled
         self.router.config.moe_router_dtype = 'fp64'
         with torch.no_grad():
-            scores, routing_map = self.router(hidden_states)
+            fp64_scores, fp64_routing_map = self.router(hidden_states)
+            assert fp64_scores.dtype == torch.float64, "Router output should be fp64 when enabled"
+
+            self.router.config.moe_router_prob_dtype = 'fp32'
+            fp32_scores, fp32_routing_map = self.router(hidden_states)
+            assert fp32_scores.dtype == torch.float32
+            assert torch.equal(fp32_routing_map, fp64_routing_map)
+            torch.testing.assert_close(fp32_scores, fp64_scores.float(), rtol=0, atol=0)
+
             out = self.sequential_mlp(hidden_states)
-            assert scores.dtype == torch.float64, "Router output should be fp64 when enabled"
             assert out[0].dtype == torch.bfloat16
+            self.router.config.moe_router_prob_dtype = None
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
