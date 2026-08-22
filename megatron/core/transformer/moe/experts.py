@@ -231,7 +231,19 @@ class TEGroupedMLP(MegatronModule):
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
         )
-        if self.activation_recompute and (self.config.fp8 or self.config.fp4):
+        self.expert_fc1_activation_recompute = (
+            self.config.recompute_granularity == 'selective'
+            and "expert_fc1_act" in self.config.recompute_modules
+        )
+        if self.expert_fc1_activation_recompute and (
+            self.offload_expert_fc1 or self.offload_moe_act
+        ):
+            raise ValueError(
+                "expert_fc1_act recomputation cannot be combined with expert activation offload."
+            )
+        if (self.activation_recompute or self.expert_fc1_activation_recompute) and (
+            self.config.fp8 or self.config.fp4
+        ):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc2)
@@ -363,18 +375,33 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        with off_interface(
-            self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
-        ) as permuted_local_hidden_states:
-            fc1_output, bias_parallel = apply_module(self.linear_fc1)(
-                permuted_local_hidden_states, tokens_per_expert
+        if self.expert_fc1_activation_recompute:
+            expert_fc1_activation_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                fp8=self.config.fp8 or self.config.fp4
             )
-        if self.offload_expert_fc1:
-            fc1_output = off_interface.group_commit(
-                fc1_output,
-                name="expert_fc1",
-                forced_released_tensors=[permuted_local_hidden_states],
+
+            def expert_fc1_activation(hidden_states, expert_probs):
+                fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                    hidden_states, tokens_per_expert
+                )
+                return self.bias_act_func(fc1_output, bias_parallel, expert_probs)
+
+            bias_act_output = expert_fc1_activation_checkpoint.checkpoint(
+                expert_fc1_activation, permuted_local_hidden_states, permuted_probs
             )
+        else:
+            with off_interface(
+                self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+            ) as permuted_local_hidden_states:
+                fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
+            if self.offload_expert_fc1:
+                fc1_output = off_interface.group_commit(
+                    fc1_output,
+                    name="expert_fc1",
+                    forced_released_tensors=[permuted_local_hidden_states],
+                )
 
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -382,12 +409,14 @@ class TEGroupedMLP(MegatronModule):
                 bias_act_output = self.activation_checkpoint.checkpoint(
                     self.bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
-        else:
+        elif not self.expert_fc1_activation_recompute:
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = self.bias_act_func(fc1_output, bias_parallel, permuted_probs)
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
+        elif self.expert_fc1_activation_recompute:
+            expert_fc1_activation_checkpoint.discard_output_and_register_recompute(output)
 
         # Delay the offload of the moe act until after the linear_fc2 has been computed
         # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.

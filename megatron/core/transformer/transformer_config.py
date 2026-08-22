@@ -482,16 +482,19 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts".
+    choices: "core_attn", "expert_fc1_act", "moe_act", "layernorm", "mla_up_proj", "mlp",
+    "moe", "shared_experts".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
+    "expert_fc1_act": recompute grouped expert FC1 and its activation together.
     "moe_act": recompute the MoE MLP activation function.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
-    "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
+    "expert_fc1_act", "moe_act", "layernorm", and "mla_up_proj" use output-discarding
+    checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -1395,6 +1398,7 @@ class TransformerConfig(ModelParallelConfig):
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
                     "core_attn",
+                    "expert_fc1_act",
                     "moe_act",
                     "layernorm",
                     "mla_up_proj",
@@ -1412,6 +1416,28 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_act in recompute_modules is only supported with moe_grouped_gemm."
                 )
+
+            if "expert_fc1_act" in self.recompute_modules:
+                if not self.moe_grouped_gemm:
+                    raise ValueError(
+                        "expert_fc1_act in recompute_modules requires moe_grouped_gemm."
+                    )
+                if self.transformer_impl != "transformer_engine":
+                    raise ValueError(
+                        "expert_fc1_act in recompute_modules requires transformer_engine."
+                    )
+                conflicting_modules = {"moe", "moe_act"}.intersection(
+                    self.recompute_modules
+                )
+                if conflicting_modules:
+                    raise ValueError(
+                        "expert_fc1_act cannot be combined with MoE recompute modules: "
+                        f"{sorted(conflicting_modules)}"
+                    )
+                if self.fp8 or self.fp4:
+                    raise ValueError(
+                        "expert_fc1_act in recompute_modules currently supports BF16/FP16 only."
+                    )
 
             if "mla_up_proj" in self.recompute_modules and not self.multi_latent_attention:
                 raise ValueError(
@@ -1459,6 +1485,10 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "Do not set --moe-layer-recompute with full recompute granularity. "
                 )
+            if "expert_fc1_act" in self.recompute_modules:
+                raise ValueError(
+                    "expert_fc1_act cannot be combined with moe_layer_recompute."
+                )
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
@@ -1467,6 +1497,10 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.cpu_offloading
             ), "fine_grained_activation_offloading cannot be enabled with cpu_offloading."
+            if "expert_fc1_act" in self.recompute_modules:
+                raise ValueError(
+                    "expert_fc1_act cannot be combined with fine-grained activation offloading."
+                )
             assert self.offload_modules is not None and len(self.offload_modules) > 0
             allowed_modules = {
                 "core_attn",
