@@ -843,6 +843,14 @@ class TransformerConfig(ModelParallelConfig):
     parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``
     and ``add_bias_linear=True``."""
 
+    moe_expert_gemm_backend: Literal['transformer_engine', 'torch'] = 'transformer_engine'
+    """Backend for grouped expert linear layers during training.
+
+    ``torch`` uses ``torch._grouped_mm`` for frozen BF16, bias-free expert weights. It is intended
+    for parameter-efficient fine-tuning where only the adapter branch is trainable. The default
+    ``transformer_engine`` backend supports trainable expert weights and other precisions.
+    """
+
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
@@ -1550,6 +1558,30 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
+
+        if self.moe_expert_gemm_backend not in ('transformer_engine', 'torch'):
+            raise ValueError(
+                "moe_expert_gemm_backend must be 'transformer_engine' or 'torch', "
+                f"got {self.moe_expert_gemm_backend!r}"
+            )
+        if self.moe_expert_gemm_backend == 'torch':
+            if self.num_moe_experts is None:
+                raise ValueError("moe_expert_gemm_backend='torch' requires num_moe_experts")
+            if not self.moe_grouped_gemm:
+                raise ValueError("moe_expert_gemm_backend='torch' requires moe_grouped_gemm=True")
+            if not self.bf16 or self.params_dtype != torch.bfloat16:
+                raise ValueError("moe_expert_gemm_backend='torch' requires BF16 parameters")
+            if self.add_bias_linear:
+                raise ValueError("moe_expert_gemm_backend='torch' does not support expert bias")
+            if self.fp8 or self.fp4:
+                raise ValueError(
+                    "moe_expert_gemm_backend='torch' does not support FP8 or FP4 experts"
+                )
+            if self.moe_single_grouped_weight:
+                raise ValueError(
+                    "moe_expert_gemm_backend='torch' requires per-GEMM expert weight parameters "
+                    "and is incompatible with moe_single_grouped_weight=True"
+                )
 
         if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size
