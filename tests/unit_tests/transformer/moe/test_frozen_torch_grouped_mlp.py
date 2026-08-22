@@ -135,3 +135,31 @@ class TestFrozenTorchGroupedMLP:
 
         assert output.shape == (0, 16)
         assert hidden_states.grad is not None
+
+    def test_zero_token_groups(self):
+        baseline = self._model(_config())
+        torch_model = self._model(_config(backend="torch"))
+        torch_model.load_state_dict(baseline.state_dict())
+        for parameter in torch_model.experts.parameters():
+            parameter.requires_grad = False
+
+        baseline_input = torch.rand(
+            (5, 16), dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        torch_input = baseline_input.detach().clone().requires_grad_(True)
+        tokens_per_expert = torch.tensor([2, 0, 3, 0], device="cuda")
+        permuted_probs = torch.rand(5, dtype=torch.float32, device="cuda")
+        baseline_output, _ = baseline.experts(
+            baseline_input, tokens_per_expert, permuted_probs
+        )
+        torch_output, _ = torch_model.experts(
+            torch_input, tokens_per_expert, permuted_probs
+        )
+        grad_output = torch.randn_like(baseline_output)
+        baseline_output.backward(grad_output)
+        torch_output.backward(grad_output)
+
+        torch.testing.assert_close(torch_output, baseline_output, rtol=0.02, atol=0.02)
+        torch.testing.assert_close(
+            torch_input.grad, baseline_input.grad, rtol=0.02, atol=0.02
+        )
