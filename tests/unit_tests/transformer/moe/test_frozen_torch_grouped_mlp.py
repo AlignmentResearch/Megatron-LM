@@ -16,7 +16,9 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
-def _config(*, backend: str = "transformer_engine") -> TransformerConfig:
+def _config(
+    *, backend: str = "transformer_engine", expert_fc1_act_recompute: bool = False
+) -> TransformerConfig:
     return TransformerConfig(
         num_layers=1,
         hidden_size=16,
@@ -32,6 +34,8 @@ def _config(*, backend: str = "transformer_engine") -> TransformerConfig:
         params_dtype=torch.bfloat16,
         moe_router_load_balancing_type="sinkhorn",
         moe_router_topk=1,
+        recompute_granularity="selective" if expert_fc1_act_recompute else None,
+        recompute_modules=["expert_fc1_act"] if expert_fc1_act_recompute else None,
     )
 
 
@@ -62,6 +66,45 @@ def test_torch_grouped_expert_gemm_config_validation(override, error):
         TransformerConfig(**kwargs)
 
 
+@pytest.mark.parametrize("conflict", ["moe", "moe_act"])
+def test_expert_fc1_activation_recompute_rejects_nested_moe_recompute(conflict):
+    with pytest.raises(ValueError, match="cannot be combined"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            num_moe_experts=2,
+            moe_grouped_gemm=True,
+            recompute_granularity="selective",
+            recompute_modules=["expert_fc1_act", conflict],
+        )
+
+
+def test_expert_fc1_activation_recompute_requires_grouped_transformer_engine():
+    with pytest.raises(ValueError, match="requires moe_grouped_gemm"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            num_moe_experts=2,
+            moe_grouped_gemm=False,
+            recompute_granularity="selective",
+            recompute_modules=["expert_fc1_act"],
+        )
+
+    with pytest.raises(ValueError, match="requires transformer_engine"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            num_moe_experts=2,
+            moe_grouped_gemm=True,
+            transformer_impl="local",
+            recompute_granularity="selective",
+            recompute_modules=["expert_fc1_act"],
+        )
+
+
 @pytest.mark.skipif(
     not is_te_min_version("1.9.0.dev0")
     or not torch.cuda.is_available()
@@ -86,7 +129,7 @@ class TestFrozenTorchGroupedMLP:
         )
         return Float16Module(config, model).module.cuda()
 
-    def test_forward_input_gradient_and_checkpoint_parity(self):
+    def test_forward_and_input_gradient_parity(self):
         baseline = self._model(_config())
         torch_model = self._model(_config(backend="torch"))
         torch_model.load_state_dict(baseline.state_dict())
@@ -116,6 +159,44 @@ class TestFrozenTorchGroupedMLP:
                 linear._buffers["_torch_grouped_weight"].untyped_storage().data_ptr()
                 == linear.weight0.untyped_storage().data_ptr()
             )
+
+    def test_expert_fc1_activation_recompute_parity_and_call_counts(self):
+        reference = self._model(_config(backend="torch"))
+        recompute = self._model(_config(backend="torch", expert_fc1_act_recompute=True))
+        recompute.load_state_dict(reference.state_dict())
+        for model in (reference, recompute):
+            for parameter in model.experts.parameters():
+                parameter.requires_grad = False
+
+        calls = {"fc1": 0, "fc2": 0}
+
+        def count_fc1(*_args):
+            calls["fc1"] += 1
+
+        def count_fc2(*_args):
+            calls["fc2"] += 1
+
+        recompute.experts.linear_fc1.register_forward_pre_hook(count_fc1)
+        recompute.experts.linear_fc2.register_forward_pre_hook(count_fc2)
+
+        reference_input = torch.rand(
+            (5, 16), dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        recompute_input = reference_input.detach().clone().requires_grad_(True)
+        tokens_per_expert = torch.tensor([2, 0, 3, 0], device="cuda")
+        reference_probs = torch.rand(5, device="cuda", requires_grad=True)
+        recompute_probs = reference_probs.detach().clone().requires_grad_(True)
+
+        reference_output, _ = reference.experts(reference_input, tokens_per_expert, reference_probs)
+        recompute_output, _ = recompute.experts(recompute_input, tokens_per_expert, recompute_probs)
+        grad_output = torch.randn_like(reference_output)
+        reference_output.backward(grad_output)
+        recompute_output.backward(grad_output)
+
+        torch.testing.assert_close(recompute_output, reference_output)
+        torch.testing.assert_close(recompute_input.grad, reference_input.grad)
+        torch.testing.assert_close(recompute_probs.grad, reference_probs.grad)
+        assert calls == {"fc1": 2, "fc2": 1}
 
     def test_no_tokens(self):
         config = deepcopy(_config(backend="torch"))

@@ -269,7 +269,19 @@ class TEGroupedMLP(MegatronModule):
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
         )
-        if self.activation_recompute and (self.config.fp8 or self.config.fp4):
+        self.expert_fc1_activation_recompute = (
+            self.config.recompute_granularity == 'selective'
+            and "expert_fc1_act" in self.config.recompute_modules
+        )
+        if self.expert_fc1_activation_recompute and (
+            self.offload_expert_fc1 or self.offload_moe_act
+        ):
+            raise ValueError(
+                "expert_fc1_act recomputation cannot be combined with expert activation offload."
+            )
+        if (self.activation_recompute or self.expert_fc1_activation_recompute) and (
+            self.config.fp8 or self.config.fp4
+        ):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc2)
@@ -789,21 +801,6 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        expert_fc1_manager = off_interface(
-            self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
-        )
-        with expert_fc1_manager as permuted_local_hidden_states:
-            fc1_output, bias_parallel = apply_module(self.linear_fc1)(
-                permuted_local_hidden_states, tokens_per_expert
-            )
-        fc1_output = expert_fc1_manager.group_offload(
-            fc1_output,
-            forced_released_tensors=[permuted_local_hidden_states],
-            delay_offload=self.config.delay_offload_until_cuda_graph,
-        )
-
-        moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
-
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
 
             # Whether activation function is interleaved GLU
@@ -879,26 +876,60 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
-        if self.activation_recompute:
-            self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with moe_act_manager as fc1_output:
-                bias_act_output = self.activation_checkpoint.checkpoint(
-                    bias_act_func, fc1_output, bias_parallel, permuted_probs
-                )
-        else:
-            with moe_act_manager as fc1_output:
-                bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
-        output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
-        if self.activation_recompute:
-            self.activation_checkpoint.discard_output_and_register_recompute(output)
+        if self.expert_fc1_activation_recompute:
+            # Discard the FC1 output as well as the activation output, and recompute both in the
+            # backward pass. The FC1 output is the largest expert activation, so checkpointing the
+            # pair saves more memory than checkpointing the activation alone.
+            expert_fc1_activation_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                fp8=self.config.fp8 or self.config.fp4
+            )
 
-        # Delay the offload of the moe act until after the linear_fc2 has been computed
-        # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
-        output = moe_act_manager.group_offload(
-            output,
-            forced_released_tensors=[fc1_output],
-            delay_offload=self.config.delay_offload_until_cuda_graph,
-        )
+            def expert_fc1_activation(hidden_states, expert_probs):
+                fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                    hidden_states, tokens_per_expert
+                )
+                return bias_act_func(fc1_output, bias_parallel, expert_probs)
+
+            bias_act_output = expert_fc1_activation_checkpoint.checkpoint(
+                expert_fc1_activation, permuted_local_hidden_states, permuted_probs
+            )
+            output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
+            expert_fc1_activation_checkpoint.discard_output_and_register_recompute(output)
+        else:
+            expert_fc1_manager = off_interface(
+                self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+            )
+            with expert_fc1_manager as permuted_local_hidden_states:
+                fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
+            fc1_output = expert_fc1_manager.group_offload(
+                fc1_output,
+                forced_released_tensors=[permuted_local_hidden_states],
+                delay_offload=self.config.delay_offload_until_cuda_graph,
+            )
+
+            moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
+            if self.activation_recompute:
+                self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                with moe_act_manager as fc1_output:
+                    bias_act_output = self.activation_checkpoint.checkpoint(
+                        bias_act_func, fc1_output, bias_parallel, permuted_probs
+                    )
+            else:
+                with moe_act_manager as fc1_output:
+                    bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+            output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
+            if self.activation_recompute:
+                self.activation_checkpoint.discard_output_and_register_recompute(output)
+
+            # Delay the offload of the moe act until after the linear_fc2 has been computed
+            # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
+            output = moe_act_manager.group_offload(
+                output,
+                forced_released_tensors=[fc1_output],
+                delay_offload=self.config.delay_offload_until_cuda_graph,
+            )
         output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
