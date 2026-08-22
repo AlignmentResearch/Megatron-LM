@@ -136,6 +136,21 @@ class TestFrozenTorchGroupedMLP:
         assert output.shape == (0, 16)
         assert hidden_states.grad is not None
 
+    def test_reprepares_after_middle_expert_weight_replacement(self):
+        model = self._model(_config(backend="torch"))
+        linear = model.experts.linear_fc1
+        for parameter in linear.parameters():
+            parameter.requires_grad = False
+        linear.prepare_torch_grouped_mm()
+        replacement = torch.randn_like(linear.weight1)
+
+        linear.weight1.data = replacement
+
+        assert not linear.torch_grouped_mm_prepared
+        linear.prepare_torch_grouped_mm()
+        assert linear.torch_grouped_mm_prepared
+        torch.testing.assert_close(linear.weight1, replacement)
+
     def test_zero_token_groups(self):
         baseline = self._model(_config())
         torch_model = self._model(_config(backend="torch"))

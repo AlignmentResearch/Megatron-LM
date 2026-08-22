@@ -2641,25 +2641,28 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 return False
 
             first_weight = self.weight0
-            last_weight = getattr(self, f'weight{self.num_gemms - 1}')
             if (
                 grouped_weight.device != first_weight.device
                 or grouped_weight.dtype != first_weight.dtype
                 or grouped_weight.shape[1:] != first_weight.shape
-                or last_weight.device != first_weight.device
             ):
                 return False
 
             storage_pointer = grouped_weight.untyped_storage().data_ptr()
             expert_elements = first_weight.numel()
-            return (
-                first_weight.untyped_storage().data_ptr() == storage_pointer
-                and first_weight.storage_offset() == 0
-                and first_weight.stride() == grouped_weight[0].stride()
-                and last_weight.untyped_storage().data_ptr() == storage_pointer
-                and last_weight.storage_offset() == (self.num_gemms - 1) * expert_elements
-                and last_weight.stride() == grouped_weight[-1].stride()
-            )
+            for index in range(self.num_gemms):
+                weight = getattr(self, f'weight{index}')
+                grouped_weight_view = grouped_weight[index]
+                if (
+                    weight.device != grouped_weight.device
+                    or weight.dtype != grouped_weight.dtype
+                    or weight.shape != grouped_weight_view.shape
+                    or weight.untyped_storage().data_ptr() != storage_pointer
+                    or weight.storage_offset() != index * expert_elements
+                    or weight.stride() != grouped_weight_view.stride()
+                ):
+                    return False
+            return True
 
         @torch.no_grad()
         def prepare_torch_grouped_mm(self) -> int:
