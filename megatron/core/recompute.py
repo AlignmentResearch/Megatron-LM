@@ -154,6 +154,13 @@ def checkpointed_forward(
             if (start + layer_offset) in extract_layer_indices:
                 intermediate_hidden_states.append(hidden_states)
 
+    if not hidden_states.requires_grad:
+        # Re-entrant checkpointing only attaches a grad_fn when some tensor input
+        # requires grad. With a frozen embedding (adapter-only training) every chunk
+        # output would otherwise carry no grad_fn and the adapters inside the chunks
+        # would receive no gradient.
+        hidden_states = hidden_states.detach().requires_grad_(True)
+
     if self.config.recompute_method == 'uniform':
         # Uniformly divide the total number of layers and checkpoint
         # the input activation of each divided chunk.
