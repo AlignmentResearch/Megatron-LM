@@ -12,6 +12,7 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import Tensor, nn
 
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -29,7 +30,11 @@ from megatron.core.transformer.module import GraphableMegatronModule, MegatronMo
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    make_viewless_tensor,
+)
 
 
 @dataclass
@@ -91,7 +96,9 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
 
-        assert pg_collection is not None, "pg_collection must be provided for MambaStack"
+        assert pg_collection is not None, (
+            "pg_collection must be provided for MambaStack"
+        )
 
         self.pp_group = pg_collection.pp
         self.tp_group = pg_collection.tp
@@ -111,9 +118,13 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         for i, layer_type in enumerate(self.layer_type_list):
             layer_number = i + 1 + pp_layer_offset
             if self.config.fp8:
-                quant_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
+                quant_init_context = get_fp8_context(
+                    self.config, i + pp_layer_offset, is_init=True
+                )
             elif self.config.fp4:
-                quant_init_context = get_fp4_context(self.config, i + pp_layer_offset, is_init=True)
+                quant_init_context = get_fp4_context(
+                    self.config, i + pp_layer_offset, is_init=True
+                )
             else:
                 quant_init_context = nullcontext()
             with quant_init_context:
@@ -201,18 +212,20 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         """
         if (
             not self.training
-            and hasattr(self, 'cudagraph_manager')
-            and kwargs['attention_mask'] is None
+            and hasattr(self, "cudagraph_manager")
+            and kwargs["attention_mask"] is None
             and (
-                kwargs.get('inference_context') is not None
-                or kwargs.get('inference_params') is not None
+                kwargs.get("inference_context") is not None
+                or kwargs.get("inference_params") is not None
             )
             and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
         ):
-            if kwargs['inference_context'].is_static_batching():
-                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            if kwargs["inference_context"].is_static_batching():
+                using_cuda_graph = kwargs["inference_context"].is_decode_only()
             else:
-                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+                using_cuda_graph = kwargs[
+                    "inference_context"
+                ].using_cuda_graph_this_step()
 
             if using_cuda_graph:
                 return True
@@ -220,13 +233,94 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
 
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
-            kwargs['hidden_states'] = (
-                kwargs['hidden_states'].unwrap()
-                if isinstance(kwargs['hidden_states'], WrappedTensor)
-                else kwargs['hidden_states']
+            kwargs["hidden_states"] = (
+                kwargs["hidden_states"].unwrap()
+                if isinstance(kwargs["hidden_states"], WrappedTensor)
+                else kwargs["hidden_states"]
             )
             return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
+
+    def _checkpointed_forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor],
+        rotary_pos_emb: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        padding_mask: Optional[Tensor],
+    ) -> Tensor:
+        """Layer-granularity ("full") activation recompute for the hybrid stack.
+
+        Mirrors TransformerBlock's checkpointed forward: layers run in chunks of
+        ``recompute_num_layers`` under ``tensor_parallel.checkpoint``, so only
+        chunk-boundary hidden states stay resident through backward.
+        """
+        assert not (self.config.fp8 or self.config.fp4), (
+            "full-granularity recompute in MambaStack supports BF16/FP16/FP32 only; "
+            "the per-layer FP8/FP4 quantization contexts are not replayed here"
+        )
+
+        def custom(start: int, end: int):
+            def custom_forward(hidden_states):
+                for index in range(start, end):
+                    layer = self.layers[index]
+                    if isinstance(layer, TransformerLayer):
+                        hidden_states, _ = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=None,
+                            rotary_pos_emb=rotary_pos_emb,
+                            sequence_len_offset=None,
+                            packed_seq_params=packed_seq_params,
+                            padding_mask=padding_mask,
+                        )
+                    else:  # MambaLayer, Expert, or MLP
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=None,
+                            packed_seq_params=packed_seq_params,
+                        )
+                    if isinstance(hidden_states, tuple):
+                        hidden_states = hidden_states[0]
+                return hidden_states
+
+            return custom_forward
+
+        if not hidden_states.requires_grad:
+            # Re-entrant checkpointing only attaches a grad_fn when some tensor
+            # input requires grad. With a frozen embedding (adapter-only
+            # training) every chunk output would otherwise carry no grad_fn and
+            # the adapters inside the chunks would receive no gradient.
+            hidden_states = hidden_states.detach().requires_grad_(True)
+
+        num_layers = len(self.layers)
+        recompute_num_layers = self.config.recompute_num_layers or 1
+        if self.config.recompute_method == "uniform":
+            index = 0
+            while index < num_layers:
+                end = min(index + recompute_num_layers, num_layers)
+                hidden_states = tensor_parallel.checkpoint(
+                    custom(index, end),
+                    self.config.distribute_saved_activations,
+                    hidden_states,
+                )
+                index = end
+        elif self.config.recompute_method == "block":
+            for index in range(num_layers):
+                if index < recompute_num_layers:
+                    hidden_states = tensor_parallel.checkpoint(
+                        custom(index, index + 1),
+                        self.config.distribute_saved_activations,
+                        hidden_states,
+                    )
+                else:
+                    hidden_states = custom(index, index + 1)(hidden_states)
+        else:
+            raise ValueError(
+                f"invalid activation recompute method {self.config.recompute_method!r}"
+            )
+        return hidden_states
 
     def forward(
         self,
@@ -257,7 +351,9 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
             Tensor: the output tensor.
         """
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
+        inference_context = deprecate_inference_params(
+            inference_context, inference_params
+        )
 
         if not self.pre_process:
             # See set_input_tensor()
@@ -278,7 +374,8 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
             (
                 (
                     self.config.cuda_graph_impl == "local"
-                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
+                    and CudaGraphScope.full_iteration
+                    not in self.config.cuda_graph_scope
                 )
                 or self.config.flash_decode
             )
@@ -290,7 +387,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
             sequence_len_offset = torch.tensor(
                 [inference_context.sequence_len_offset] * current_batch_size,
                 dtype=torch.int32,
-                device='cuda',
+                device="cuda",
             )
         else:
             sequence_len_offset = None
@@ -300,10 +397,16 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         # if we are using other fp8 recipes, then the context manager enter&exit are free
         # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
         # control which layer will be fp8 or bf16
-        use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
-        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        use_outer_fp8_context = (
+            self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
+        )
+        use_inner_fp8_context = (
+            self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        )
         use_fp4_context = self.config.fp4 is not None
-        outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+        outer_fp8_context = (
+            get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+        )
 
         if use_inner_fp8_context:
 
@@ -321,33 +424,44 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                 return nullcontext()
 
         with outer_fp8_context:
-            for layer in self.layers:
-                # Layers have 1-indexed layer numbers attribute.
-                inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
-                with inner_quant_context:
-                    if isinstance(layer, TransformerLayer):
-                        hidden_states, _ = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            rotary_pos_emb=rotary_pos_emb,
-                            sequence_len_offset=sequence_len_offset,
-                            packed_seq_params=packed_seq_params,
-                            padding_mask=padding_mask,
-                        )
-                    else:  # MambaLayer, Expert, or MLP
-                        hidden_states = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
-                        )
+            if self.config.recompute_granularity == "full" and self.training:
+                hidden_states = self._checkpointed_forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                )
+            else:
+                for layer in self.layers:
+                    # Layers have 1-indexed layer numbers attribute.
+                    inner_quant_context = get_inner_quant_context(
+                        self.config, layer.layer_number - 1
+                    )
+                    with inner_quant_context:
+                        if isinstance(layer, TransformerLayer):
+                            hidden_states, _ = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                rotary_pos_emb=rotary_pos_emb,
+                                sequence_len_offset=sequence_len_offset,
+                                packed_seq_params=packed_seq_params,
+                                padding_mask=padding_mask,
+                            )
+                        else:  # MambaLayer, Expert, or MLP
+                            hidden_states = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                            )
 
-                # The attention layer (currently a simplified transformer layer)
-                # outputs a tuple of (hidden_states, context). Context is intended
-                # for cross-attention, and is not needed in our model.
-                if isinstance(hidden_states, tuple):
-                    hidden_states = hidden_states[0]
+                    # The attention layer (currently a simplified transformer layer)
+                    # outputs a tuple of (hidden_states, context). Context is intended
+                    # for cross-attention, and is not needed in our model.
+                    if isinstance(hidden_states, tuple):
+                        hidden_states = hidden_states[0]
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
@@ -356,14 +470,16 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         # Ensure that the tensor passed between pipeline parallel stages is
         # viewless. See related notes in TransformerBlock and TransformerLayer
         hidden_states = make_viewless_tensor(
-            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+            inp=hidden_states,
+            requires_grad=hidden_states.requires_grad,
+            keep_graph=True,
         )
 
         return hidden_states
 
     def sharded_state_dict(
         self,
-        prefix: str = '',
+        prefix: str = "",
         sharded_offsets: Optional[tuple] = None,
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
@@ -384,23 +500,26 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         """
 
         sharded_state_dict = {}
-        layer_prefix = f'{prefix}layers.'
+        layer_prefix = f"{prefix}layers."
 
         for local_layer_idx, layer in enumerate(self.layers):
-
-            global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
+            global_layer_offset = (
+                layer.layer_number - 1
+            )  # self.layer_number starts at 1
             state_dict_prefix = (
-                f'{layer_prefix}{local_layer_idx}.'  # module list index in MambaBlock
+                f"{layer_prefix}{local_layer_idx}."  # module list index in MambaBlock
             )
 
-            sharded_prefix = f'{layer_prefix}{global_layer_offset}.'
+            sharded_prefix = f"{layer_prefix}{global_layer_offset}."
             sharded_pp_offset = []
 
             layer_sharded_state_dict = layer.sharded_state_dict(
                 state_dict_prefix, sharded_pp_offset, metadata
             )
 
-            replace_prefix_for_sharding(layer_sharded_state_dict, state_dict_prefix, sharded_prefix)
+            replace_prefix_for_sharding(
+                layer_sharded_state_dict, state_dict_prefix, sharded_prefix
+            )
 
             sharded_state_dict.update(layer_sharded_state_dict)
 
@@ -410,7 +529,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                 sharded_state_dict.update(
                     sharded_state_dict_default(
                         module,
-                        f'{prefix}{name}.',
+                        f"{prefix}{name}.",
                         sharded_offsets,
                         metadata,
                         tp_group=self.tp_group,
