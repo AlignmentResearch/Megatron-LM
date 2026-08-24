@@ -155,6 +155,7 @@ class _TorchGroupedFusedLoRA(torch.autograd.Function):
         scale: float,
         counters: Dict[str, int],
     ) -> Tensor:
+        """Forward pass."""
         with torch.no_grad():
             augmented_weight[:, output_features:, :].copy_(lora_a)
         augmented_output = _run_torch_grouped_mm(x, augmented_weight.transpose(1, 2), offsets)
@@ -171,6 +172,7 @@ class _TorchGroupedFusedLoRA(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
+        """Backward pass."""
         x, lora_b, low_rank, offsets = ctx.saved_tensors
         grad_low_rank = ctx.scale * grad_output.matmul(lora_b)
         grad_augmented_output = torch.cat((grad_output, grad_low_rank), dim=-1)

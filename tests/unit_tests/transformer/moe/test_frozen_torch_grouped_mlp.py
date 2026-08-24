@@ -249,20 +249,14 @@ class TestFrozenTorchGroupedMLP:
         torch_input = baseline_input.detach().clone().requires_grad_(True)
         tokens_per_expert = torch.tensor([2, 0, 3, 0], device="cuda")
         permuted_probs = torch.rand(5, dtype=torch.float32, device="cuda")
-        baseline_output, _ = baseline.experts(
-            baseline_input, tokens_per_expert, permuted_probs
-        )
-        torch_output, _ = torch_model.experts(
-            torch_input, tokens_per_expert, permuted_probs
-        )
+        baseline_output, _ = baseline.experts(baseline_input, tokens_per_expert, permuted_probs)
+        torch_output, _ = torch_model.experts(torch_input, tokens_per_expert, permuted_probs)
         grad_output = torch.randn_like(baseline_output)
         baseline_output.backward(grad_output)
         torch_output.backward(grad_output)
 
         torch.testing.assert_close(torch_output, baseline_output, rtol=0.02, atol=0.02)
-        torch.testing.assert_close(
-            torch_input.grad, baseline_input.grad, rtol=0.02, atol=0.02
-        )
+        torch.testing.assert_close(torch_input.grad, baseline_input.grad, rtol=0.02, atol=0.02)
 
 
 def test_fused_expert_lora_matches_shared_adapter_and_gradients_on_cpu():
@@ -277,46 +271,27 @@ def test_fused_expert_lora_matches_shared_adapter_and_gradients_on_cpu():
     fused_a = reference_a.detach().clone().requires_grad_(True)
     fused_b = reference_b.detach().clone().requires_grad_(True)
     scale = 2.5
-    base_output = _run_torch_grouped_mm(
-        reference_input, base_weight.transpose(1, 2), offsets
+    base_output = _run_torch_grouped_mm(reference_input, base_weight.transpose(1, 2), offsets)
+    reference = base_output + scale * reference_input.matmul(reference_a.transpose(0, 1)).matmul(
+        reference_b.transpose(0, 1)
     )
-    reference = base_output + scale * reference_input.matmul(
-        reference_a.transpose(0, 1)
-    ).matmul(reference_b.transpose(0, 1))
     augmented_weight = base_weight.new_empty((3, 10, 5))
     augmented_weight[:, :7, :].copy_(base_weight)
     augmented_weight[:, 7:, :].copy_(fused_a)
-    counters = {
-        "forward_calls": 0,
-        "backward_calls": 0,
-        "base_only_forward_calls": 0,
-    }
+    counters = {"forward_calls": 0, "backward_calls": 0, "base_only_forward_calls": 0}
     fused = _TorchGroupedFusedLoRA.apply(
-        fused_input,
-        augmented_weight,
-        fused_a,
-        fused_b,
-        offsets,
-        7,
-        scale,
-        counters,
+        fused_input, augmented_weight, fused_a, fused_b, offsets, 7, scale, counters
     )
     grad_output = torch.randn_like(reference)
     reference_grads = torch.autograd.grad(
         reference, (reference_input, reference_a, reference_b), grad_output
     )
-    fused_grads = torch.autograd.grad(
-        fused, (fused_input, fused_a, fused_b), grad_output
-    )
+    fused_grads = torch.autograd.grad(fused, (fused_input, fused_a, fused_b), grad_output)
 
     torch.testing.assert_close(fused, reference)
     for actual, expected in zip(fused_grads, reference_grads):
         torch.testing.assert_close(actual, expected)
-    assert counters == {
-        "forward_calls": 1,
-        "backward_calls": 1,
-        "base_only_forward_calls": 0,
-    }
+    assert counters == {"forward_calls": 1, "backward_calls": 1, "base_only_forward_calls": 0}
 
 
 @pytest.mark.skipif(
