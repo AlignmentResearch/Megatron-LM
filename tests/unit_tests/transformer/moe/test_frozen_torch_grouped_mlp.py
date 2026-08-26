@@ -1,7 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from copy import deepcopy
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -118,8 +116,7 @@ class TestFrozenTorchGroupedMLP:
             )
 
     def test_no_tokens(self):
-        config = deepcopy(_config(backend="torch"))
-        model = self._model(config)
+        model = self._model(_config(backend="torch"))
         for parameter in model.experts.parameters():
             parameter.requires_grad = False
         hidden_states = torch.empty(
