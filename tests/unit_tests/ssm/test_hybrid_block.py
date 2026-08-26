@@ -228,6 +228,46 @@ class TestHybridBlock:
             gb, gr = base_grads[name], rec_grads[name]
             assert torch.equal(gr, gb), f"Grad should be bitwise matched for {name}"
 
+    def test_full_recompute_with_frozen_input_trains_adapter(self):
+        """Full re-entrant recompute preserves gradients for adapter-only training."""
+        block = self.get_hybrid_block(
+            Symbols.MLP,
+            add_bias_linear=False,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+        ).cuda()
+        block.requires_grad_(False)
+        block.train()
+
+        adapter = torch.nn.Sequential(
+            torch.nn.Linear(block.config.hidden_size, 4, bias=False),
+            torch.nn.Linear(4, block.config.hidden_size, bias=False),
+        ).cuda()
+        block.layers[0].add_module("adapter", adapter)
+
+        def add_adapter(_module, _args, kwargs, output):
+            hidden_states, context = output
+            return hidden_states + adapter(kwargs["hidden_states"]), context
+
+        block.layers[0].register_forward_hook(add_adapter, with_kwargs=True)
+
+        sequence_length, micro_batch_size = 4, 1
+        hidden_states = torch.randn(
+            sequence_length, micro_batch_size, block.config.hidden_size, device="cuda"
+        )
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool, device="cuda"
+        )
+
+        assert not hidden_states.requires_grad
+        output = block(hidden_states, attention_mask=attention_mask)
+        output.float().square().mean().backward()
+
+        for parameter in adapter.parameters():
+            assert parameter.grad is not None
+            assert torch.count_nonzero(parameter.grad) > 0
+
     def test_layer_types(self):
         """
         Make sure that the layer types specified with layer_pattern
