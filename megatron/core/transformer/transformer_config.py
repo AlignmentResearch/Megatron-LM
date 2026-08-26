@@ -1582,6 +1582,11 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_expert_gemm_backend='torch' requires per-GEMM expert weight parameters "
                     "and is incompatible with moe_single_grouped_weight=True"
                 )
+            if self.use_transformer_engine_op_fuser:
+                raise ValueError(
+                    "moe_expert_gemm_backend='torch' is incompatible with "
+                    "use_transformer_engine_op_fuser=True"
+                )
 
         if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size

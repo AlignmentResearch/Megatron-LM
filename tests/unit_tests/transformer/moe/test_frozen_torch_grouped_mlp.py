@@ -40,6 +40,10 @@ def _config(*, backend: str = "transformer_engine") -> TransformerConfig:
         ({"moe_grouped_gemm": False}, "requires moe_grouped_gemm=True"),
         ({"bf16": False, "params_dtype": torch.float32}, "requires BF16 parameters"),
         ({"add_bias_linear": True}, "does not support expert bias"),
+        (
+            {"use_transformer_engine_op_fuser": True},
+            "is incompatible with use_transformer_engine_op_fuser=True",
+        ),
     ],
 )
 def test_torch_grouped_expert_gemm_config_validation(override, error):
