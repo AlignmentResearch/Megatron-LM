@@ -11,6 +11,8 @@ import pickle
 import re
 import warnings
 from contextlib import contextmanager, nullcontext
+from itertools import accumulate
+from numbers import Integral
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
@@ -2358,6 +2360,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 name (str | None): module instance name passed top-down from its paranet module
             """
             self.config = config
+            self.expert_gemm_backend = config.moe_expert_gemm_backend
 
             # TE returns a zero length Tensor when bias=False and
             # return_bias=True, but we prefer None.  So in that case we
@@ -2632,6 +2635,141 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 f"into {self.num_gemms} GEMM shards."
             )
 
+        def _torch_grouped_weight_layout_is_current(self) -> bool:
+            """Return whether each expert parameter still views the contiguous buffer."""
+            grouped_weight = self._buffers.get('_torch_grouped_weight')
+            if grouped_weight is None or grouped_weight.shape[0] != self.num_gemms:
+                return False
+
+            first_weight = self.weight0
+            if (
+                grouped_weight.device != first_weight.device
+                or grouped_weight.dtype != first_weight.dtype
+                or grouped_weight.shape[1:] != first_weight.shape
+            ):
+                return False
+
+            storage_pointer = grouped_weight.untyped_storage().data_ptr()
+            expert_elements = first_weight.numel()
+            for index in range(self.num_gemms):
+                weight = getattr(self, f'weight{index}')
+                grouped_weight_view = grouped_weight[index]
+                if (
+                    weight.device != grouped_weight.device
+                    or weight.dtype != grouped_weight.dtype
+                    or weight.shape != grouped_weight_view.shape
+                    or weight.untyped_storage().data_ptr() != storage_pointer
+                    or weight.storage_offset() != index * expert_elements
+                    or weight.stride() != grouped_weight_view.stride()
+                ):
+                    return False
+            return True
+
+        @torch.no_grad()
+        def prepare_torch_grouped_mm(self) -> int:
+            """Relocate frozen BF16 expert weights into one contiguous allocation.
+
+            The existing per-expert ``Parameter`` objects become views of the new allocation, so
+            parameter names and checkpoint structure remain unchanged. The backing allocation is a
+            non-persistent buffer and therefore does not add a checkpoint entry.
+
+            Returns:
+                Number of bytes in the contiguous backing allocation.
+            """
+            if self.expert_gemm_backend != 'torch':
+                raise RuntimeError(
+                    "prepare_torch_grouped_mm requires moe_expert_gemm_backend='torch'"
+                )
+            self._resolve_torch_grouped_mm()
+            if self.use_bias:
+                raise RuntimeError("torch grouped expert GEMM does not support bias")
+            if getattr(self, 'single_grouped_weight', False):
+                raise RuntimeError(
+                    "torch grouped expert GEMM expects per-GEMM weight parameters, but "
+                    "moe_single_grouped_weight=True makes TE hold one grouped weight tensor"
+                )
+
+            weights = [getattr(self, f'weight{index}') for index in range(self.num_gemms)]
+            if any(weight.requires_grad for weight in weights):
+                raise RuntimeError("torch grouped expert GEMM requires frozen base weights")
+            if any(weight.device.type != 'cuda' for weight in weights):
+                raise RuntimeError("torch grouped expert GEMM requires CUDA weights")
+            if any(weight.dtype != torch.bfloat16 for weight in weights):
+                raise RuntimeError("torch grouped expert GEMM requires BF16 weights")
+            if any(weight.shape != weights[0].shape for weight in weights[1:]):
+                raise RuntimeError("torch grouped expert GEMM requires uniform expert shapes")
+
+            if not self._torch_grouped_weight_layout_is_current():
+                grouped_weight = torch.stack([weight.detach() for weight in weights]).contiguous()
+                for index, weight in enumerate(weights):
+                    weight.data = grouped_weight[index]
+                if '_torch_grouped_weight' in self._buffers:
+                    self._buffers['_torch_grouped_weight'] = grouped_weight
+                else:
+                    self.register_buffer('_torch_grouped_weight', grouped_weight, persistent=False)
+
+            grouped_weight = self._buffers['_torch_grouped_weight']
+            return grouped_weight.numel() * grouped_weight.element_size()
+
+        @property
+        def torch_grouped_mm_prepared(self) -> bool:
+            """Return whether the torch grouped GEMM backing allocation is ready."""
+            return self._torch_grouped_weight_layout_is_current()
+
+        @staticmethod
+        def _resolve_torch_grouped_mm():
+            """Return the public torch grouped GEMM, with the legacy private op as fallback."""
+            grouped_mm = getattr(F, 'grouped_mm', None)
+            if grouped_mm is None:
+                grouped_mm = getattr(torch, '_grouped_mm', None)
+            if grouped_mm is None:
+                raise RuntimeError(
+                    "this PyTorch build does not provide torch.nn.functional.grouped_mm "
+                    "or torch._grouped_mm"
+                )
+            return grouped_mm
+
+        def _validate_torch_grouped_mm_splits(self, m_splits) -> list[int]:
+            """Validate and normalize the token count for each local expert."""
+            try:
+                split_count = len(m_splits)
+            except TypeError as error:
+                raise RuntimeError(
+                    f"expected {self.num_gemms} expert splits, but expert splits are not a sequence"
+                ) from error
+            if split_count != self.num_gemms:
+                raise RuntimeError(f"expected {self.num_gemms} expert splits, got {split_count}")
+            if any(
+                isinstance(split, bool) or not isinstance(split, Integral) or split < 0
+                for split in m_splits
+            ):
+                raise RuntimeError("expert splits must be non-negative integers")
+            return [int(split) for split in m_splits]
+
+        def _torch_grouped_mm_forward(self, x, m_splits):
+            """Run the frozen expert base branch with torch grouped GEMM."""
+            m_splits = self._validate_torch_grouped_mm_splits(m_splits)
+            if not self._torch_grouped_weight_layout_is_current():
+                self.prepare_torch_grouped_mm()
+
+            x_2d = x.reshape(-1, x.shape[-1])
+            input_rows = sum(m_splits)
+            if input_rows != x_2d.shape[0]:
+                raise RuntimeError(
+                    f"expert splits sum to {input_rows}, but input has {x_2d.shape[0]} rows"
+                )
+
+            grouped_weight = self._buffers['_torch_grouped_weight']
+            if input_rows == 0:
+                output = x_2d.matmul(grouped_weight[0].transpose(0, 1))
+            else:
+                offsets = torch.tensor(
+                    list(accumulate(m_splits)), device=x.device, dtype=torch.int32
+                )
+                grouped_mm = self._resolve_torch_grouped_mm()
+                output = grouped_mm(x_2d, grouped_weight.transpose(1, 2), offs=offsets)
+            return output.reshape(*x.shape[:-1], output.shape[-1]), None
+
         def finish_init(self, quantization_config: QuantizationConfig):
             """Post-init of quantization override"""
             if quantization_config is None:
@@ -2647,6 +2785,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def forward(self, x, m_splits):
             """Forward."""
+            if self.expert_gemm_backend == 'torch':
+                return self._torch_grouped_mm_forward(x, m_splits)
+
             _is_first_microbatch = (
                 None if self.disable_parameter_transpose_cache else self.is_first_microbatch
             )
