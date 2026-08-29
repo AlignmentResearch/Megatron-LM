@@ -61,14 +61,16 @@ if [ "$DRY_RUN" = "1" ]; then echo "DRY_RUN=1 — stopping before any change."; 
 
 git checkout -q -b "$SYNC_BRANCH"
 echo "Merging $(git rev-parse --short=9 "$TARGET") into $SYNC_BRANCH ..."
-if ! git merge --no-ff "$TARGET" -m "Merge upstream $(git rev-parse --short=9 "$TARGET") into $START_BRANCH"; then
+if ! git merge --no-ff --signoff -S "$TARGET" -m "Merge upstream $(git rev-parse --short=9 "$TARGET") into $START_BRANCH"; then
+  git rev-parse -q --verify MERGE_HEAD >/dev/null || \
+    die "merge failed before creating a conflict state (check commit-signing configuration)"
   cat <<'RECOVER'
 
 Merge stopped on a conflict. Resolve it, then:
 
-    git add <files> && git commit          # completes the merge
+    git add <files> && git commit --signoff -S   # completes the merge
     make fork-base                         # regenerate the manifest
-    git add .fork-base.json && git commit -m "chore: record new upstream base"
+    git add .fork-base.json && git commit --signoff -S -m "chore: record new upstream base"
 
 Resolve deliberately: taking --ours wholesale keeps our version of a file and silently discards
 upstream's changes to it, while the recorded base still claims we contain that upstream commit.
@@ -78,10 +80,17 @@ RECOVER
   exit 1
 fi
 
+# Keep the internal fork's GitHub surface lean after every upstream merge. The retained GitLab
+# CI and .github/actions/scripts helpers are inert on GitHub; upstream workflow definitions and
+# NVIDIA ownership/bot configuration are not.
+find .github/workflows -mindepth 1 -maxdepth 1 ! -name fork-base.yml -exec rm -rf -- {} +
+rm -f -- .github/CODEOWNERS .github/copy-pr-bot.yaml
+git add -A -- .github/workflows .github/CODEOWNERS .github/copy-pr-bot.yaml
+
 python3 tools/fork_base.py --write
 if [ -n "$(git status --porcelain -- .fork-base.json)" ]; then
   git add .fork-base.json
-  git commit -q -m "chore(fork-base): record upstream base $(git rev-parse --short=9 "$TARGET")"
+  git commit -q --signoff -S -m "chore(fork-base): record upstream base $(git rev-parse --short=9 "$TARGET")"
 fi
 
 echo

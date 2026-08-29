@@ -30,6 +30,15 @@ SPEC.loader.exec_module(fork_base)
 
 
 class TestForkBaseIdentity(unittest.TestCase):
+    def test_only_internal_fork_workflow_remains(self) -> None:
+        root = Path(__file__).parents[2]
+        workflows = sorted(
+            path.relative_to(root).as_posix()
+            for path in (root / ".github" / "workflows").rglob("*")
+            if path.is_file()
+        )
+        self.assertEqual(workflows, [".github/workflows/fork-base.yml"])
+
     def test_root_fork_must_match_origin(self) -> None:
         manifest = {"fork_repo": "https://github.com/AlignmentResearch/Megatron-LM"}
         with patch.object(
