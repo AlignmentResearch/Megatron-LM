@@ -228,29 +228,40 @@ class TestHybridBlock:
             gb, gr = base_grads[name], rec_grads[name]
             assert torch.equal(gr, gb), f"Grad should be bitwise matched for {name}"
 
-    def test_full_recompute_with_frozen_input_trains_adapter(self):
+    @pytest.mark.parametrize(
+        ("recompute_method", "num_layers", "recompute_num_layers"),
+        [pytest.param("uniform", 2, 1, id="uniform"), pytest.param("block", 3, 2, id="block")],
+    )
+    def test_full_recompute_with_frozen_input_trains_adapter(
+        self, recompute_method: str, num_layers: int, recompute_num_layers: int
+    ):
         """Full re-entrant recompute preserves gradients for adapter-only training."""
         block = self.get_hybrid_block(
-            Symbols.MLP,
+            Symbols.MLP * num_layers,
             add_bias_linear=False,
             recompute_granularity="full",
-            recompute_method="uniform",
-            recompute_num_layers=1,
+            recompute_method=recompute_method,
+            recompute_num_layers=recompute_num_layers,
         ).cuda()
         block.requires_grad_(False)
         block.train()
 
-        adapter = torch.nn.Sequential(
-            torch.nn.Linear(block.config.hidden_size, 4, bias=False),
-            torch.nn.Linear(4, block.config.hidden_size, bias=False),
-        ).cuda()
-        block.layers[0].add_module("adapter", adapter)
+        def register_adapter(layer):
+            adapter = torch.nn.Sequential(
+                torch.nn.Linear(block.config.hidden_size, 4, bias=False),
+                torch.nn.Linear(4, block.config.hidden_size, bias=False),
+            ).cuda()
+            layer.add_module("adapter", adapter)
 
-        def add_adapter(_module, _args, kwargs, output):
-            hidden_states, context = output
-            return hidden_states + adapter(kwargs["hidden_states"]), context
+            def apply_adapter(_module, _args, kwargs, output):
+                hidden_states, context = output
+                return hidden_states + adapter(kwargs["hidden_states"]), context
 
-        block.layers[0].register_forward_hook(add_adapter, with_kwargs=True)
+            layer.register_forward_hook(apply_adapter, with_kwargs=True)
+            return adapter
+
+        # Block recompute checkpoints layer 0 but not the final layer in this configuration.
+        adapters = [register_adapter(block.layers[index]) for index in (0, num_layers - 1)]
 
         sequence_length, micro_batch_size = 4, 1
         hidden_states = torch.randn(
@@ -264,9 +275,10 @@ class TestHybridBlock:
         output = block(hidden_states, attention_mask=attention_mask)
         output.float().square().mean().backward()
 
-        for parameter in adapter.parameters():
-            assert parameter.grad is not None
-            assert torch.count_nonzero(parameter.grad) > 0
+        for adapter in adapters:
+            for parameter in adapter.parameters():
+                assert parameter.grad is not None
+                assert torch.count_nonzero(parameter.grad) > 0
 
     def test_layer_types(self):
         """

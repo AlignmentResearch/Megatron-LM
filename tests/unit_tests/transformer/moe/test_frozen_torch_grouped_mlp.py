@@ -67,7 +67,7 @@ def test_torch_grouped_expert_gemm_config_validation(override, error):
 @pytest.mark.skipif(
     not is_te_min_version("1.9.0.dev0")
     or not torch.cuda.is_available()
-    or not hasattr(torch, "_grouped_mm")
+    or not (hasattr(F, "grouped_mm") or hasattr(torch, "_grouped_mm"))
     or torch.cuda.get_device_capability()[0] < 10,
     reason="torch grouped expert GEMM requires TE and a compatible CUDA device",
 )
@@ -136,6 +136,62 @@ class TestFrozenTorchGroupedMLP:
 
         assert output.shape == (0, 16)
         assert hidden_states.grad is not None
+
+    @pytest.mark.parametrize(
+        "m_splits,error",
+        [
+            ([0, 0, 0], "expected 4 expert splits, got 3"),
+            ([0, 0, 0, 0, 0], "expected 4 expert splits, got 5"),
+            ([1, -1, 0, 0], "expert splits must be non-negative integers"),
+            ([0, 0, 0, 0.0], "expert splits must be non-negative integers"),
+        ],
+    )
+    def test_no_tokens_rejects_malformed_splits(self, m_splits, error):
+        model = self._model(_config(backend="torch"))
+        linear = model.experts.linear_fc1
+        hidden_states = torch.empty((0, 16), dtype=torch.bfloat16, device="cuda")
+
+        with pytest.raises(RuntimeError, match=error):
+            linear(hidden_states, m_splits)
+
+    @pytest.mark.parametrize("available_api", ["public", "private"])
+    def test_nonempty_forward_uses_available_grouped_mm(self, monkeypatch, available_api):
+        model = self._model(_config(backend="torch"))
+        linear = model.experts.linear_fc1
+        for parameter in linear.parameters():
+            parameter.requires_grad = False
+        hidden_states = torch.randn((4, 16), dtype=torch.bfloat16, device="cuda")
+        m_splits = [1, 1, 1, 1]
+        expected = torch.cat(
+            [
+                hidden_states[index : index + 1] @ getattr(linear, f"weight{index}").transpose(0, 1)
+                for index in range(4)
+            ]
+        )
+        seen_offsets = []
+
+        def grouped_mm(mat_a, mat_b, *, offs):
+            seen_offsets.append(offs.clone())
+            outputs = []
+            start = 0
+            for expert_index, end in enumerate(offs.tolist()):
+                outputs.append(mat_a[start:end] @ mat_b[expert_index])
+                start = end
+            return torch.cat(outputs)
+
+        if available_api == "public":
+            monkeypatch.setattr(F, "grouped_mm", grouped_mm, raising=False)
+            monkeypatch.delattr(torch, "_grouped_mm", raising=False)
+        else:
+            monkeypatch.delattr(F, "grouped_mm", raising=False)
+            monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising=False)
+
+        output, output_bias = linear(hidden_states, m_splits)
+
+        assert len(seen_offsets) == 1
+        assert seen_offsets[0].tolist() == [1, 2, 3, 4]
+        torch.testing.assert_close(output, expected)
+        assert output_bias is None
 
     def test_reprepares_after_middle_expert_weight_replacement(self):
         model = self._model(_config(backend="torch"))

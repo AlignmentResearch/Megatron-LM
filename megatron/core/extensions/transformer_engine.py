@@ -12,6 +12,7 @@ import re
 import warnings
 from contextlib import contextmanager, nullcontext
 from itertools import accumulate
+from numbers import Integral
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
@@ -2679,8 +2680,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 raise RuntimeError(
                     "prepare_torch_grouped_mm requires moe_expert_gemm_backend='torch'"
                 )
-            if not hasattr(torch, '_grouped_mm'):
-                raise RuntimeError("this PyTorch build does not provide torch._grouped_mm")
+            self._resolve_torch_grouped_mm()
             if self.use_bias:
                 raise RuntimeError("torch grouped expert GEMM does not support bias")
             if getattr(self, 'single_grouped_weight', False):
@@ -2716,8 +2716,39 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             """Return whether the torch grouped GEMM backing allocation is ready."""
             return self._torch_grouped_weight_layout_is_current()
 
+        @staticmethod
+        def _resolve_torch_grouped_mm():
+            """Return the public torch grouped GEMM, with the legacy private op as fallback."""
+            grouped_mm = getattr(F, 'grouped_mm', None)
+            if grouped_mm is None:
+                grouped_mm = getattr(torch, '_grouped_mm', None)
+            if grouped_mm is None:
+                raise RuntimeError(
+                    "this PyTorch build does not provide torch.nn.functional.grouped_mm "
+                    "or torch._grouped_mm"
+                )
+            return grouped_mm
+
+        def _validate_torch_grouped_mm_splits(self, m_splits) -> list[int]:
+            """Validate and normalize the token count for each local expert."""
+            try:
+                split_count = len(m_splits)
+            except TypeError as error:
+                raise RuntimeError(
+                    f"expected {self.num_gemms} expert splits, but expert splits are not a sequence"
+                ) from error
+            if split_count != self.num_gemms:
+                raise RuntimeError(f"expected {self.num_gemms} expert splits, got {split_count}")
+            if any(
+                isinstance(split, bool) or not isinstance(split, Integral) or split < 0
+                for split in m_splits
+            ):
+                raise RuntimeError("expert splits must be non-negative integers")
+            return [int(split) for split in m_splits]
+
         def _torch_grouped_mm_forward(self, x, m_splits):
-            """Run the frozen expert base branch with ``torch._grouped_mm``."""
+            """Run the frozen expert base branch with torch grouped GEMM."""
+            m_splits = self._validate_torch_grouped_mm_splits(m_splits)
             if not self._torch_grouped_weight_layout_is_current():
                 self.prepare_torch_grouped_mm()
 
@@ -2735,7 +2766,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 offsets = torch.tensor(
                     list(accumulate(m_splits)), device=x.device, dtype=torch.int32
                 )
-                output = torch._grouped_mm(x_2d, grouped_weight.transpose(1, 2), offs=offsets)
+                grouped_mm = self._resolve_torch_grouped_mm()
+                output = grouped_mm(x_2d, grouped_weight.transpose(1, 2), offs=offsets)
             return output.reshape(*x.shape[:-1], output.shape[-1]), None
 
         def finish_init(self, quantization_config: QuantizationConfig):

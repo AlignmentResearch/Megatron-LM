@@ -1587,6 +1587,31 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_expert_gemm_backend='torch' is incompatible with "
                     "use_transformer_engine_op_fuser=True"
                 )
+            if self.delay_wgrad_compute:
+                raise ValueError(
+                    "moe_expert_gemm_backend='torch' is incompatible with "
+                    "delay_wgrad_compute=True"
+                )
+            if self.overlap_dispatch_backward_with_experts_wgrad:
+                raise ValueError(
+                    "moe_expert_gemm_backend='torch' is incompatible with "
+                    "overlap_dispatch_backward_with_experts_wgrad=True"
+                )
+            if self.transformer_impl != 'transformer_engine':
+                raise ValueError(
+                    "moe_expert_gemm_backend='torch' requires "
+                    "transformer_impl='transformer_engine' to construct TEGroupedMLP"
+                )
+
+            # Import lazily to avoid the transformer_engine -> TransformerConfig import cycle and
+            # prevent TEGroupedMLP from silently falling back to SequentialMLP.
+            from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
+
+            if TEColumnParallelGroupedLinear is None:
+                raise ValueError(
+                    "moe_expert_gemm_backend='torch' requires Transformer Engine >= 1.9.0.dev0 "
+                    "with GroupedLinear support"
+                )
 
         if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size
