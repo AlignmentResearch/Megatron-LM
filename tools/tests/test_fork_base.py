@@ -34,14 +34,7 @@ SPEC.loader.exec_module(fork_base)
 class TestForkBaseIdentity(unittest.TestCase):
     def test_only_internal_fork_workflow_remains(self) -> None:
         root = Path(__file__).parents[2]
-        workflows = sorted(
-            path.relative_to(root).as_posix()
-            for path in (root / ".github" / "workflows").rglob("*")
-            if path.is_file()
-        )
-        self.assertEqual(workflows, [".github/workflows/fork-base.yml"])
-        self.assertFalse((root / ".github" / "CODEOWNERS").exists())
-        self.assertFalse((root / ".github" / "copy-pr-bot.yaml").exists())
+        self._assert_nvidia_automation_pruned(root)
 
     def test_sync_prunes_reintroduced_upstream_automation(self) -> None:
         source_root = Path(__file__).parents[2]
@@ -106,19 +99,15 @@ class TestForkBaseIdentity(unittest.TestCase):
                 text=True,
             )
 
-            workflows = sorted(path.name for path in (fork / ".github/workflows").iterdir())
-            self.assertEqual(workflows, ["fork-base.yml"])
-            self.assertFalse((fork / ".github/CODEOWNERS").exists())
-            self.assertFalse((fork / ".github/copy-pr-bot.yaml").exists())
+            self._assert_nvidia_automation_pruned(fork)
             self.assertEqual(self._git("status", "--porcelain", cwd=fork).stdout, "")
 
             for commit in self._git(
                 "rev-list", "--max-count=2", "HEAD", cwd=fork
             ).stdout.splitlines():
                 raw_commit = self._git("cat-file", "commit", commit, cwd=fork).stdout
-                message = self._git("show", "-s", "--format=%B", commit, cwd=fork).stdout
                 self.assertIn("gpgsig -----BEGIN SSH SIGNATURE-----", raw_commit)
-                self.assertIn("Signed-off-by: Test User <test@example.com>", message)
+                self.assertIn("Signed-off-by: Test User <test@example.com>", raw_commit)
 
             self._write(fork / ".github/scripts/helper.py", "fork implementation\n")
             self._git("add", ".github/scripts/helper.py", cwd=fork)
@@ -142,10 +131,17 @@ class TestForkBaseIdentity(unittest.TestCase):
                 "diff", "--name-only", "--diff-filter=U", cwd=fork
             ).stdout.splitlines()
             self.assertEqual(unmerged, [".github/scripts/helper.py"])
-            workflows = sorted(path.name for path in (fork / ".github/workflows").iterdir())
-            self.assertEqual(workflows, ["fork-base.yml"])
-            self.assertFalse((fork / ".github/CODEOWNERS").exists())
-            self.assertFalse((fork / ".github/copy-pr-bot.yaml").exists())
+            self._assert_nvidia_automation_pruned(fork)
+
+    def _assert_nvidia_automation_pruned(self, root: Path) -> None:
+        workflows = sorted(
+            path.relative_to(root).as_posix()
+            for path in (root / ".github" / "workflows").rglob("*")
+            if path.is_file()
+        )
+        self.assertEqual(workflows, [".github/workflows/fork-base.yml"])
+        self.assertFalse((root / ".github" / "CODEOWNERS").exists())
+        self.assertFalse((root / ".github" / "copy-pr-bot.yaml").exists())
 
     @staticmethod
     def _configure_repo(repo: Path) -> None:
