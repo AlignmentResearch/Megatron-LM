@@ -23,7 +23,12 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 prune_nvidia_github_automation() {
   find .github/workflows -mindepth 1 -maxdepth 1 ! -name fork-base.yml -exec rm -rf -- {} +
   rm -f -- .github/CODEOWNERS .github/copy-pr-bot.yaml
-  git add -A -- .github
+  git add -A -- .github/workflows
+  for removed_path in .github/CODEOWNERS .github/copy-pr-bot.yaml; do
+    if git ls-files --error-unmatch -- "$removed_path" >/dev/null 2>&1; then
+      git add -A -- "$removed_path"
+    fi
+  done
 }
 
 git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository"
@@ -70,8 +75,11 @@ echo "Merging $(git rev-parse --short=9 "$TARGET") into $SYNC_BRANCH ..."
 MERGE_MESSAGE="Merge upstream $(git rev-parse --short=9 "$TARGET") into $START_BRANCH"
 if ! git merge --no-ff --no-commit --signoff "$TARGET"; then
   git rev-parse -q --verify MERGE_HEAD >/dev/null || die "merge failed before creating a conflict state"
-  prune_nvidia_github_automation
-  if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+fi
+
+# Upstream merges may reintroduce or conflict on NVIDIA-only GitHub automation.
+prune_nvidia_github_automation
+if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
   cat <<'RECOVER'
 
 Merge stopped on a conflict. Resolve it, then:
@@ -85,16 +93,15 @@ upstream's changes to it, while the recorded base still claims we contain that u
 
 To abandon:  git merge --abort && git checkout - && git branch -D <sync branch>
 RECOVER
-    exit 1
-  fi
+  exit 1
 fi
 
-# Keep the internal fork's GitHub surface lean after every upstream merge. The retained GitLab
-# CI and .github/actions/scripts helpers are inert on GitHub; upstream workflow definitions and
-# NVIDIA ownership/bot configuration are not.
-prune_nvidia_github_automation
 git commit -q --signoff -S -m "$MERGE_MESSAGE" || \
-  die "merge content is resolved but the signed merge commit failed; configure signing and run: git commit --signoff -S"
+  die "merge content is resolved but the signed merge commit failed. Configure signing, then run:
+  git commit --signoff -S
+  make fork-base
+  git add .fork-base.json && git commit --signoff -S -m 'chore(fork-base): record new upstream base'
+  make fork-base-check"
 
 python3 tools/fork_base.py --write
 if [ -n "$(git status --porcelain -- .fork-base.json)" ]; then

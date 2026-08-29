@@ -112,6 +112,41 @@ class TestForkBaseIdentity(unittest.TestCase):
             self.assertFalse((fork / ".github/copy-pr-bot.yaml").exists())
             self.assertEqual(self._git("status", "--porcelain", cwd=fork).stdout, "")
 
+            for commit in self._git(
+                "rev-list", "--max-count=2", "HEAD", cwd=fork
+            ).stdout.splitlines():
+                raw_commit = self._git("cat-file", "commit", commit, cwd=fork).stdout
+                message = self._git("show", "-s", "--format=%B", commit, cwd=fork).stdout
+                self.assertIn("gpgsig -----BEGIN SSH SIGNATURE-----", raw_commit)
+                self.assertIn("Signed-off-by: Test User <test@example.com>", message)
+
+            self._write(fork / ".github/scripts/helper.py", "fork implementation\n")
+            self._git("add", ".github/scripts/helper.py", cwd=fork)
+            self._git("commit", "-m", "fork helper change", cwd=fork)
+            self._write(upstream / ".github/scripts/helper.py", "upstream implementation\n")
+            self._write(upstream / ".github/workflows/another.yml", "name: More NVIDIA CI\n")
+            self._write(upstream / ".github/CODEOWNERS", "* @NVIDIA/another-team\n")
+            self._write(upstream / ".github/copy-pr-bot.yaml", "enabled: true\n")
+            self._git("add", ".", cwd=upstream)
+            self._git("commit", "-m", "upstream helper conflict", cwd=upstream)
+
+            conflicted = subprocess.run(
+                ["bash", "tools/sync_upstream.sh"],
+                cwd=fork,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(conflicted.returncode, 0)
+            unmerged = self._git(
+                "diff", "--name-only", "--diff-filter=U", cwd=fork
+            ).stdout.splitlines()
+            self.assertEqual(unmerged, [".github/scripts/helper.py"])
+            workflows = sorted(path.name for path in (fork / ".github/workflows").iterdir())
+            self.assertEqual(workflows, ["fork-base.yml"])
+            self.assertFalse((fork / ".github/CODEOWNERS").exists())
+            self.assertFalse((fork / ".github/copy-pr-bot.yaml").exists())
+
     @staticmethod
     def _configure_repo(repo: Path) -> None:
         TestForkBaseIdentity._git("config", "user.name", "Test User", cwd=repo)
@@ -172,7 +207,7 @@ class TestForkBaseIdentity(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertEqual(
             notes,
-            ["origin/farai/main has no .fork-base.json yet — " "forward-only check not applicable"],
+            ["origin/farai/main has no .fork-base.json yet — forward-only check not applicable"],
         )
 
 
