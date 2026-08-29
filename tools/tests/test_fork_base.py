@@ -17,7 +17,9 @@
 
 import importlib.util
 import json
+import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -38,13 +40,96 @@ class TestForkBaseIdentity(unittest.TestCase):
             if path.is_file()
         )
         self.assertEqual(workflows, [".github/workflows/fork-base.yml"])
+        self.assertFalse((root / ".github" / "CODEOWNERS").exists())
+        self.assertFalse((root / ".github" / "copy-pr-bot.yaml").exists())
+
+    def test_sync_prunes_reintroduced_upstream_automation(self) -> None:
+        source_root = Path(__file__).parents[2]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            upstream = temp / "upstream"
+            fork = temp / "fork"
+            key = temp / "signing-key"
+
+            self._git("init", "-b", "main", str(upstream), cwd=temp)
+            self._configure_repo(upstream)
+            self._write(upstream / ".github/workflows/nvidia.yml", "name: NVIDIA\n")
+            self._write(upstream / ".github/CODEOWNERS", "* @NVIDIA/mcore\n")
+            self._write(upstream / ".github/copy-pr-bot.yaml", "enabled: true\n")
+            self._write(upstream / "upstream.txt", "base\n")
+            self._git("add", ".", cwd=upstream)
+            self._git("commit", "-m", "upstream base", cwd=upstream)
+            base = self._git("rev-parse", "HEAD", cwd=upstream).stdout.strip()
+
+            self._git("clone", str(upstream), str(fork), cwd=temp)
+            self._configure_repo(fork)
+            self._git("remote", "add", "upstream", str(upstream), cwd=fork)
+            (fork / "tools").mkdir()
+            shutil.copy2(source_root / "tools/fork_base.py", fork / "tools/fork_base.py")
+            shutil.copy2(source_root / "tools/sync_upstream.sh", fork / "tools/sync_upstream.sh")
+            shutil.copytree(
+                source_root / ".github/workflows", fork / ".github/workflows", dirs_exist_ok=True
+            )
+            for path in (fork / ".github/workflows").iterdir():
+                if path.name != "fork-base.yml":
+                    path.unlink()
+            (fork / ".github/CODEOWNERS").unlink()
+            (fork / ".github/copy-pr-bot.yaml").unlink()
+            manifest = {
+                "schema": 1,
+                "fork_repo": str(upstream),
+                "upstream_repo": str(upstream),
+                "upstream_branch": "main",
+                "upstream_base": base,
+            }
+            self._write(fork / ".fork-base.json", json.dumps(manifest, indent=2) + "\n")
+            self._git("add", ".", cwd=fork)
+            self._git("commit", "-m", "fork scaffolding", cwd=fork)
+
+            self._write(upstream / ".github/workflows/new.yml", "name: New NVIDIA workflow\n")
+            self._write(upstream / ".github/CODEOWNERS", "* @NVIDIA/new-team\n")
+            self._write(upstream / ".github/copy-pr-bot.yaml", "enabled: false\n")
+            self._write(upstream / "upstream.txt", "updated\n")
+            self._git("add", ".", cwd=upstream)
+            self._git("commit", "-m", "upstream update", cwd=upstream)
+
+            subprocess.run(
+                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True
+            )
+            self._git("config", "gpg.format", "ssh", cwd=fork)
+            self._git("config", "user.signingkey", str(key), cwd=fork)
+            subprocess.run(
+                ["bash", "tools/sync_upstream.sh"],
+                cwd=fork,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            workflows = sorted(path.name for path in (fork / ".github/workflows").iterdir())
+            self.assertEqual(workflows, ["fork-base.yml"])
+            self.assertFalse((fork / ".github/CODEOWNERS").exists())
+            self.assertFalse((fork / ".github/copy-pr-bot.yaml").exists())
+            self.assertEqual(self._git("status", "--porcelain", cwd=fork).stdout, "")
+
+    @staticmethod
+    def _configure_repo(repo: Path) -> None:
+        TestForkBaseIdentity._git("config", "user.name", "Test User", cwd=repo)
+        TestForkBaseIdentity._git("config", "user.email", "test@example.com", cwd=repo)
+
+    @staticmethod
+    def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+    @staticmethod
+    def _write(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
 
     def test_root_fork_must_match_origin(self) -> None:
         manifest = {"fork_repo": "https://github.com/AlignmentResearch/Megatron-LM"}
         with patch.object(
-            fork_base,
-            "_git",
-            return_value="https://github.com/example/other-fork.git",
+            fork_base, "_git", return_value="https://github.com/example/other-fork.git"
         ):
             self.assertEqual(
                 fork_base.check_root_identity(Path("/repo"), manifest),
@@ -87,10 +172,7 @@ class TestForkBaseIdentity(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertEqual(
             notes,
-            [
-                "origin/farai/main has no .fork-base.json yet — "
-                "forward-only check not applicable"
-            ],
+            ["origin/farai/main has no .fork-base.json yet — " "forward-only check not applicable"],
         )
 
 
